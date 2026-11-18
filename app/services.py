@@ -333,7 +333,16 @@ def _clean_json_response(content: str) -> dict:
         match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
         if match:
             cleaned = match.group(1).strip()
-    return json.loads(cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", cleaned)
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("AI response JSON must be an object.")
+    return parsed
 
 
 def _grounded_outreach_email(candidate_yaml: str, company_name: str, target_role: str | None) -> tuple[str, str]:
@@ -390,6 +399,7 @@ STRICT RULES:
 4. The email body must be concise, professional, mention the company name, cite one evidenced company/job fact, include no aggressive pressure, and state that the tailored CV is attached in PDF format.
 5. Use the research to identify the company's services, hiring signals, priorities, terminology, and likely skills; reflect those in the headline, profile emphasis, skills ordering, role, and email.
 6. Return a genuinely tailored CV, not a byte-for-byte copy of the original. Never invent a requirement when the research does not support it.
+7. Preserve every original RenderCV section and every factual list entry; rewrite or reorder wording only, without omitting entries or changing section names.
 
 Company: {company_name}
 {f'Target Role: {target_role}' if target_role else ''}
@@ -423,8 +433,20 @@ Original RenderCV YAML:
         else:
             raise
 
-    content = _llm_content(response)
-    result = _clean_json_response(content)
+    result = None
+    last_error = None
+    for attempt in range(LLM_REQUEST_ATTEMPTS):
+        try:
+            result = _clean_json_response(_llm_content(response))
+            break
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            if attempt == LLM_REQUEST_ATTEMPTS - 1:
+                raise ValueError("AI returned invalid JSON after five attempts.") from exc
+            response = _llm_request(httpx.post, url, headers=headers, json=payload)
+            response.raise_for_status()
+    if result is None:
+        raise ValueError("AI returned no usable tailoring result.") from last_error
 
     for key in ("cv_yaml", "email_subject", "email_body"):
         if not isinstance(result.get(key), str) or not result[key].strip():

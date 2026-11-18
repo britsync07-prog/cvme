@@ -70,10 +70,13 @@ def main() -> None:
                     f"Daily preparation target missed: prepared {result['completed']} of {settings.outreach_daily_limit}."
                 )
             return
-        if result["completed"] == 0:
+        if result["discovered"] == 0:
             print(json.dumps(totals))
             action = "send" if settings.outreach_auto_send else "preparation"
             raise SystemExit(f"Daily {action} target missed: {remaining} slots remain; no new verified leads were available.")
+        if result["completed"] == 0:
+            # A failed AI/render/send attempt must not prevent trying the next lead.
+            continue
 
 
 if __name__ == "__main__":

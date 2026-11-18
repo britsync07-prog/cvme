@@ -3,6 +3,7 @@ Description=Run TailorMail daily outreach batch
 
 [Timer]
 OnCalendar=*-*-* 09:00:00
+OnUnitInactiveSec=15min
 Persistent=true
 Unit=tailormail-daily.service
 

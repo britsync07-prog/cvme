@@ -5,7 +5,7 @@
 3. Set `DATABASE_URL` exactly for the Compose PostgreSQL service, then set the AI, Companies House, Resend, candidate, and outreach values. Set `OUTREACH_AUTO_SEND=false` for the first manual check.
 4. Set an unused `APP_PORT` (the default is `18080`), start with `docker compose up -d --build`, and verify `curl -f http://127.0.0.1:$APP_PORT/healthz` returns JSON status `ok`.
 5. Put the real hostname into `Caddyfile.example`, install it as the Caddy configuration, and set `ALLOWED_HOSTS` to that hostname.
-6. Copy the two `tailormail-daily.*` files into `/etc/systemd/system/`, then run `systemctl daemon-reload && systemctl enable --now tailormail-daily.timer`.
+6. Copy the two `tailormail-daily.*` files into `/etc/systemd/system/`, then run `systemctl daemon-reload && systemctl enable --now tailormail-daily.timer`. The timer checks again every 15 minutes until the daily send budget is exhausted.
 
 Run `docker compose run --rm --no-deps app python -m app.daily_outreach` once manually before enabling the timer. It performs the same preflight as the timer and will exit nonzero until every production value is ready.
 

@@ -53,6 +53,21 @@ def test_healthz_is_available_with_dashboard_auth_configured(monkeypatch):
     assert response.status_code == 200
 
 
+def test_login_form_protects_dashboard_with_a_session(monkeypatch):
+    monkeypatch.setattr(main.settings, "admin_username", "admin")
+    monkeypatch.setattr(main.settings, "admin_password", "Saimon55@")
+
+    with TestClient(app, base_url="http://localhost") as client:
+        assert client.get("/", follow_redirects=False).headers["location"] == "/login?next=/"
+        assert client.post("/login", data={"username": "admin", "password": "wrong", "next": "/"}).status_code == 401
+        login = client.post("/login", data={"username": "admin", "password": "Saimon55@", "next": "/"}, follow_redirects=False)
+        assert login.status_code == 303
+        assert login.headers["location"] == "/"
+        assert client.get("/").status_code == 200
+        assert client.post("/logout", follow_redirects=False).status_code == 303
+        assert client.get("/", follow_redirects=False).status_code == 303
+
+
 def test_production_configuration_rejects_sqlite_database():
     env = os.environ | {
         "ENVIRONMENT": "production",

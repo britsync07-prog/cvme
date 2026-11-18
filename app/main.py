@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 import secrets
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -13,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import settings, update_settings
@@ -51,15 +53,16 @@ templates = Jinja2Templates(directory="templates")
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if settings.admin_username and request.url.path != "/healthz":
-            auth = request.headers.get("authorization", "")
-            expected = f"Basic {__import__('base64').b64encode(f'{settings.admin_username}:{settings.admin_password}'.encode()).decode()}"
-            if not secrets.compare_digest(auth, expected):
-                return PlainTextResponse(
-                    "Authentication required",
-                    401,
-                    {"WWW-Authenticate": 'Basic realm="TailorMail"'},
-                )
+        if (
+            settings.admin_username
+            and request.url.path not in {"/healthz", "/login"}
+            and not request.url.path.startswith("/static/")
+            and not request.session.get("authenticated")
+        ):
+            target = request.url.path
+            if request.url.query:
+                target = f"{target}?{request.url.query}"
+            return RedirectResponse(f"/login?next={quote(target, safe='/?=&')}", status_code=303)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
@@ -77,6 +80,14 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SecurityMiddleware)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.app_secret,
+    session_cookie="tailormail_session",
+    max_age=60 * 60 * 12,
+    same_site="lax",
+    https_only=settings.environment == "production",
+)
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -87,6 +98,37 @@ def healthz():
     except SQLAlchemyError as exc:
         raise HTTPException(503, "Database unavailable") from exc
     return {"status": "ok"}
+
+
+def _safe_next(next_path: str) -> str:
+    return next_path if next_path.startswith("/") and not next_path.startswith("//") else "/"
+
+
+@app.get("/login")
+def login_page(request: Request, next: str = "/"):
+    if request.session.get("authenticated"):
+        return RedirectResponse(_safe_next(next), status_code=303)
+    return templates.TemplateResponse(request, "login.html", {"next": _safe_next(next), "error": ""})
+
+
+@app.post("/login")
+def login(request: Request, username: str = Form(), password: str = Form(), next: str = Form("/")):
+    if settings.admin_username and secrets.compare_digest(username, settings.admin_username) and secrets.compare_digest(password, settings.admin_password):
+        request.session.clear()
+        request.session["authenticated"] = True
+        return RedirectResponse(_safe_next(next), status_code=303)
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {"next": _safe_next(next), "error": "Incorrect username or password."},
+        status_code=401,
+    )
+
+
+@app.post("/logout")
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
 
 
 def audit(db, campaign: Campaign, action: str, detail: str) -> None:

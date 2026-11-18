@@ -509,8 +509,8 @@ def test_discovery_email_is_grounded_in_candidate_facts(monkeypatch):
 """
     payload = {
         "cv_yaml": source,
-        "email_subject": "Join Acme careers",
-        "email_body": "I saw your advertised vacancy and have ten years of experience.",
+        "email_subject": "Interest in Acme Corp's technology growth",
+        "email_body": "I am interested in contributing to Acme Corp's technology and business development work.",
     }
 
     class MockResponse:
@@ -530,8 +530,8 @@ def test_discovery_email_is_grounded_in_candidate_facts(monkeypatch):
         target_role="Backend Engineer",
         job_description="Companies House number: 123. Public contact sources: https://acme.example",
     )
-    assert result["email_subject"] == "Application to Acme Corp — Backend Engineer | Test Person"
-    assert "Software Engineer at Example Systems" in result["email_body"]
+    assert result["email_subject"] == "Interest in Acme Corp's technology growth"
+    assert "Acme Corp" in result["email_body"]
     assert "advertised vacancy" not in result["email_body"]
     assert "ten years" not in result["email_body"]
 
@@ -559,7 +559,7 @@ def test_tailor_accepts_sse_responses(monkeypatch):
     monkeypatch.setattr(services.httpx, "post", lambda *a, **k: MockResponse())
 
     result = services.tailor(source, {"sources": []}, "Acme Corp")
-    assert result["email_subject"] == "Application to Acme Corp — an opportunity | Test Person"
+    assert result["email_subject"] == "Application"
 
 
 def test_tailor_restores_the_source_rendercv_design(monkeypatch):

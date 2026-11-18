@@ -374,7 +374,7 @@ def tailor(
 
     original_name = parsed_source.get("cv", {}).get("name", "")
 
-    role_str = f" for the position of {target_role}" if target_role else ""
+    role_str = f" for the position of {target_role}" if target_role else "; infer the most relevant role from the company evidence"
     prompt = f"""You are a professional CV tailoring and job application assistant.
 Your goal is to tailor the candidate's RenderCV YAML and draft an application email specifically for {company_name}{role_str}.
 
@@ -388,7 +388,7 @@ STRICT RULES:
 2. You may reorder sections, emphasize matching skills, and refine wording to match the company's domain and tech stack.
 3. Keep valid RenderCV YAML conforming to RenderCV specifications.
 4. The email body must be concise, professional, mention the company name, cite one evidenced company/job fact, include no aggressive pressure, and state that the tailored CV is attached in PDF format.
-5. Use the research to identify the company's services, hiring signals, priorities, terminology, and likely skills; reflect those in the headline, profile emphasis, skills ordering, and email.
+5. Use the research to identify the company's services, hiring signals, priorities, terminology, and likely skills; reflect those in the headline, profile emphasis, skills ordering, role, and email.
 6. Return a genuinely tailored CV, not a byte-for-byte copy of the original. Never invent a requirement when the research does not support it.
 
 Company: {company_name}
@@ -466,13 +466,6 @@ Original RenderCV YAML:
         if isinstance(tailored_data.get("cv"), dict):
             tailored_data["cv"].pop("design", None)
     result["cv_yaml"] = yaml.dump(tailored_data, sort_keys=False)
-
-    # Discovery only has public company facts, not a verified vacancy. Do not let a
-    # model invent a job advert, hiring process, or candidate achievements in email.
-    if not job_description or job_description.startswith("Companies House number:"):
-        result["email_subject"], result["email_body"] = _grounded_outreach_email(
-            candidate_yaml, company_name, target_role
-        )
 
     return result
 

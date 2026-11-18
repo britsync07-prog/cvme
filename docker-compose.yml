@@ -19,6 +19,8 @@ services:
   app:
     build: .
     env_file: .env
+    environment:
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS},localhost,127.0.0.1
     depends_on:
       db:
         condition: service_healthy

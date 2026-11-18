@@ -360,7 +360,7 @@ def test_search_web_uses_duckduckgo_lite_when_html_has_no_results(monkeypatch):
         def raise_for_status(self):
             pass
 
-    responses = iter((Response("no results"), Response(
+    responses = iter((Response("no results"), Response("no results"), Response(
         '<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Facme.example%2F&amp;rut=x" class=\'result-link\'>Acme</a>'
     )))
     monkeypatch.setattr(services.httpx, "get", lambda *a, **k: next(responses))

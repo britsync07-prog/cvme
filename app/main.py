@@ -51,7 +51,7 @@ templates = Jinja2Templates(directory="templates")
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if settings.admin_username and request.url.path != "/static":
+        if settings.admin_username and request.url.path != "/healthz":
             auth = request.headers.get("authorization", "")
             expected = f"Basic {__import__('base64').b64encode(f'{settings.admin_username}:{settings.admin_password}'.encode()).decode()}"
             if not secrets.compare_digest(auth, expected):

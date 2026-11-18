@@ -43,6 +43,16 @@ def test_healthz_checks_database_connection():
     assert response.json() == {"status": "ok"}
 
 
+def test_healthz_is_available_with_dashboard_auth_configured(monkeypatch):
+    monkeypatch.setattr(main.settings, "admin_username", "admin")
+    monkeypatch.setattr(main.settings, "admin_password", "password")
+
+    with TestClient(app, base_url="http://localhost") as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+
+
 def test_production_configuration_rejects_sqlite_database():
     env = os.environ | {
         "ENVIRONMENT": "production",

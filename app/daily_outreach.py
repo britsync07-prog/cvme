@@ -57,7 +57,7 @@ def main() -> None:
             candidate_id=settings.outreach_candidate_id,
             query=settings.outreach_query,
             target_role=settings.outreach_target_role,
-            limit=remaining,
+            limit=1 if settings.outreach_auto_send else remaining,
             send_when_ready=settings.outreach_auto_send,
         )
         result = json.loads(response.body)

@@ -387,7 +387,7 @@ def test_daily_worker_retries_until_daily_send_target_is_met(monkeypatch):
 
     daily_outreach.main()
 
-    assert limits == [100, 60]
+    assert limits == [1, 1]
 
 
 def test_search_web_uses_duckduckgo_lite_when_html_has_no_results(monkeypatch):

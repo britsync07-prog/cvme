@@ -72,6 +72,8 @@ def _llm_content(response: httpx.Response) -> str:
 
 
 def _public_url(value: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("Website URL contains invalid control characters.")
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Website URL must start with http:// or https://")
@@ -119,7 +121,9 @@ def _search_web(query: str) -> list[str]:
                         destination = base64.b64decode(encoded[2:] + "===").decode("utf-8")
                     except (UnicodeDecodeError, ValueError):
                         continue
-            if destination.startswith(("http://", "https://")):
+            if destination.startswith(("http://", "https://")) and not any(
+                ord(character) < 32 or ord(character) == 127 for character in destination
+            ):
                 results.append(destination)
         if results:
             return results

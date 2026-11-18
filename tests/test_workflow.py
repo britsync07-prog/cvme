@@ -50,6 +50,20 @@ def test_search_web_uses_bing_results_before_fallbacks(monkeypatch):
     assert services._search_web("example company") == ["https://example.com/contact"]
 
 
+def test_search_web_skips_bing_urls_with_control_characters(monkeypatch):
+    encoded_url = base64.b64encode(b"https://example.com/\x12contact").decode()
+
+    class Response:
+        text = f'<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?u=a1{encoded_url}">Example</a></h2></li>'
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(services.httpx, "get", lambda *args, **kwargs: Response())
+
+    assert services._search_web("example company") == []
+
+
 def test_healthz_checks_database_connection():
     with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/healthz")

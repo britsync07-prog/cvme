@@ -35,6 +35,18 @@ def test_research_rejects_unsafe_url():
         raise AssertionError("unsafe URL was accepted")
 
 
+def test_search_web_uses_bing_results_before_fallbacks(monkeypatch):
+    class Response:
+        text = '<li class="b_algo"><h2><a href="https://example.com/contact">Example</a></h2></li>'
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(services.httpx, "get", lambda *args, **kwargs: Response())
+
+    assert services._search_web("example company") == ["https://example.com/contact"]
+
+
 def test_healthz_checks_database_connection():
     with TestClient(app, base_url="http://localhost") as client:
         response = client.get("/healthz")

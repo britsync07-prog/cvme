@@ -96,6 +96,7 @@ def _website_text(website: str) -> tuple[str, str]:
 
 def _search_web(query: str) -> list[str]:
     for search_url, pattern in (
+        ("https://www.bing.com/search", r'<li class="b_algo"[^>]*>.*?<h2><a href="([^"]+)"'),
         ("https://html.duckduckgo.com/html/", r'class="result__a"[^>]+href="([^"]+)"'),
         ("https://lite.duckduckgo.com/lite/", r'href="([^"]+)" class=[\'\"]result-link'),
     ):
@@ -108,7 +109,7 @@ def _search_web(query: str) -> list[str]:
         except httpx.HTTPError:
             continue
         results: list[str] = []
-        for link in re.findall(pattern, response.text):
+        for link in re.findall(pattern, response.text, flags=re.S):
             parsed = urlparse(unquote(link.replace("&amp;", "&")))
             destination = parse_qs(parsed.query).get("uddg", [link])[0]
             if destination.startswith(("http://", "https://")):

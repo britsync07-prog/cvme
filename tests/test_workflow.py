@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import subprocess
@@ -36,8 +37,10 @@ def test_research_rejects_unsafe_url():
 
 
 def test_search_web_uses_bing_results_before_fallbacks(monkeypatch):
+    encoded_url = base64.b64encode(b"https://example.com/contact").decode()
+
     class Response:
-        text = '<li class="b_algo"><h2><a href="https://example.com/contact">Example</a></h2></li>'
+        text = f'<li class="b_algo"><h2><a class="result" href="https://www.bing.com/ck/a?u=a1{encoded_url}">Example</a></h2></li>'
 
         def raise_for_status(self):
             pass

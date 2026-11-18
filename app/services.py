@@ -96,7 +96,7 @@ def _website_text(website: str) -> tuple[str, str]:
 
 def _search_web(query: str) -> list[str]:
     for search_url, pattern in (
-        ("https://www.bing.com/search", r'<li class="b_algo"[^>]*>.*?<h2><a href="([^"]+)"'),
+        ("https://www.bing.com/search", r'<li class="b_algo"[^>]*>.*?<h2[^>]*>.*?<a[^>]+href="([^"]+)"'),
         ("https://html.duckduckgo.com/html/", r'class="result__a"[^>]+href="([^"]+)"'),
         ("https://lite.duckduckgo.com/lite/", r'href="([^"]+)" class=[\'\"]result-link'),
     ):
@@ -112,6 +112,13 @@ def _search_web(query: str) -> list[str]:
         for link in re.findall(pattern, response.text, flags=re.S):
             parsed = urlparse(unquote(link.replace("&amp;", "&")))
             destination = parse_qs(parsed.query).get("uddg", [link])[0]
+            if parsed.hostname and parsed.hostname.endswith("bing.com"):
+                encoded = parse_qs(parsed.query).get("u", [""])[0]
+                if encoded.startswith("a1"):
+                    try:
+                        destination = base64.b64decode(encoded[2:] + "===").decode("utf-8")
+                    except (UnicodeDecodeError, ValueError):
+                        continue
             if destination.startswith(("http://", "https://")):
                 results.append(destination)
         if results:

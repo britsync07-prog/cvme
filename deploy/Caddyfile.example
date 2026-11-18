@@ -1,0 +1,8 @@
+out.ascentraconsulting.co.uk {
+    reverse_proxy 127.0.0.1:18080 {
+        transport http {
+            read_timeout 10m
+            write_timeout 10m
+        }
+    }
+}

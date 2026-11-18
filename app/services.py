@@ -1,0 +1,551 @@
+import base64
+import json
+import ipaddress
+import re
+import smtplib
+import socket
+import subprocess
+import sys
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+import httpx
+import yaml
+
+from .config import settings
+
+
+LLM_TIMEOUT_SECONDS = 300
+LLM_REQUEST_ATTEMPTS = 5
+COMPANIES_HOUSE_URL = "https://api.company-information.service.gov.uk"
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+GENERIC_MAILBOXES = {"careers", "jobs", "hr", "recruitment", "talent", "hiring", "people", "contact", "hello", "info", "help", "support"}
+DISCOVERY_WORKERS = 6  # shortcut: bounded public-web fetching, raise only with provider rate-limit monitoring.
+
+
+def _llm_url(base_url: str, endpoint: str) -> str:
+    """Accept provider roots with or without a trailing /v1."""
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    return f"{root}/v1/{endpoint.lstrip('/')}"
+
+
+def _llm_request(request, *args, **kwargs) -> httpx.Response:
+    """Retry transport failures from slow or temporarily unavailable providers."""
+    for attempt in range(LLM_REQUEST_ATTEMPTS):
+        try:
+            return request(*args, timeout=LLM_TIMEOUT_SECONDS, **kwargs)
+        except httpx.RequestError:
+            if attempt == LLM_REQUEST_ATTEMPTS - 1:
+                raise
+    raise RuntimeError("Unreachable")
+
+
+def _llm_content(response: httpx.Response) -> str:
+    """Read standard OpenAI JSON or OpenAI-compatible SSE responses."""
+    headers = getattr(response, "headers", {})
+    if "text/event-stream" not in headers.get("content-type", "").lower():
+        return response.json()["choices"][0]["message"]["content"]
+
+    parts: list[str] = []
+    for line in response.text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            break
+        event = json.loads(data)
+        choices = event.get("choices") or []
+        if choices:
+            content = choices[0].get("delta", {}).get("content")
+            if isinstance(content, str):
+                parts.append(content)
+    if not parts:
+        raise ValueError("LLM stream did not contain assistant content.")
+    return "".join(parts)
+
+
+def _public_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Website URL must start with http:// or https://")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, None)}
+    except socket.gaierror as exc:
+        raise ValueError("Website host cannot be resolved.") from exc
+    if any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("Website must resolve to a public IP address.")
+    return value
+
+
+def _website_text(website: str) -> tuple[str, str]:
+    response = httpx.get(
+        _public_url(website), timeout=15, follow_redirects=True,
+        headers={"User-Agent": "TailorMail research bot/1.0"},
+    )
+    response.raise_for_status()
+    text = re.sub(r"<[^>]+>", " ", response.text)
+    return str(response.url), re.sub(r"\s+", " ", text).strip()
+
+
+def _search_web(query: str) -> list[str]:
+    for search_url, pattern in (
+        ("https://html.duckduckgo.com/html/", r'class="result__a"[^>]+href="([^"]+)"'),
+        ("https://lite.duckduckgo.com/lite/", r'href="([^"]+)" class=[\'\"]result-link'),
+    ):
+        try:
+            response = httpx.get(
+                search_url, params={"q": query}, timeout=20,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; TailorMail/1.0)"},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            continue
+        results: list[str] = []
+        for link in re.findall(pattern, response.text):
+            parsed = urlparse(unquote(link.replace("&amp;", "&")))
+            destination = parse_qs(parsed.query).get("uddg", [link])[0]
+            if destination.startswith(("http://", "https://")):
+                results.append(destination)
+        if results:
+            return results
+    return []
+
+
+def _companies_house_results(query: str, limit: int, start_index: int = 0) -> list[dict]:
+    if not settings.companies_house_api_key:
+        raise ValueError("COMPANIES_HOUSE_API_KEY is required for company discovery.")
+    response = httpx.get(
+        f"{COMPANIES_HOUSE_URL}/search/companies", params={"q": query, "items_per_page": limit, "start_index": start_index},
+        auth=(settings.companies_house_api_key, ""), timeout=20,
+    )
+    response.raise_for_status()
+    return [item for item in response.json().get("items", []) if item.get("company_status") == "active"]
+
+
+def _discover_company_record(company: dict) -> dict:
+    name = company["title"]
+    website = next(
+        (url for url in _search_web(f"{name} official website") if urlparse(url).hostname not in {"find-and-update.company-information.service.gov.uk", "duckduckgo.com"}),
+        None,
+    )
+    if not website:
+        raise ValueError("Could not find a public company website.")
+    site_url, page = _website_text(website)
+    parsed = urlparse(site_url)
+    pages = [(site_url, page)]
+    for suffix in ("/contact", "/contact-us", "/careers"):
+        try:
+            pages.append(_website_text(f"{parsed.scheme}://{parsed.netloc}{suffix}"))
+        except (httpx.HTTPError, ValueError):
+            continue
+    emails = {email.lower() for _, text in pages for email in EMAIL_RE.findall(text.replace("\\u003e", ">"))}
+    generic = sorted(
+        (email for email in emails if email.split("@", 1)[0] in GENERIC_MAILBOXES),
+        key=lambda email: (email.split("@", 1)[0] not in {"careers", "jobs", "hr", "recruitment"}, email),
+    )
+    if not generic:
+        raise ValueError("Company website has no published generic contact email.")
+    return {"company_name": name, "company_number": company.get("company_number", ""), "company_url": site_url, "recipient_email": generic[0], "source_urls": [url for url, _ in pages]}
+
+
+def discover_company_lead(query: str) -> dict:
+    """Find one active UK company and a published generic contact address."""
+    terms = [term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 2]
+    companies = _companies_house_results(query, 20)
+    company = max(companies, key=lambda item: sum(term in item.get("title", "").lower() for term in terms), default=None)
+    if not company or not any(term in company.get("title", "").lower() for term in terms):
+        raise ValueError("No active Companies House result found.")
+    return _discover_company_record(company)
+
+
+def discover_company_leads(
+    query: str,
+    limit: int,
+    existing_names: set[str] | None = None,
+    existing_numbers: set[str] | None = None,
+) -> list[dict]:
+    """Find up to ``limit`` new, active UK companies with published generic contact addresses."""
+    existing_names = existing_names or set()
+    existing_numbers = existing_numbers or set()
+    leads: list[dict] = []
+    seen_numbers: set[str] = set()
+    for term in (part.strip() for part in re.split(r"[;\n]+", query) if part.strip()):
+        for start_index in range(0, 500, 100):
+            companies = _companies_house_results(term, 100, start_index)
+            if not companies:
+                break
+            candidates = []
+            for company in companies:
+                number = company.get("company_number", "")
+                if company.get("title", "").casefold() in existing_names or number in existing_numbers or number in seen_numbers:
+                    continue
+                seen_numbers.add(number)
+                candidates.append(company)
+            for offset in range(0, len(candidates), DISCOVERY_WORKERS):
+                batch = candidates[offset:offset + DISCOVERY_WORKERS]
+                def discover_or_none(company: dict) -> dict | None:
+                    try:
+                        return _discover_company_record(company)
+                    except (httpx.HTTPError, ValueError):
+                        return None
+                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                    for lead in executor.map(discover_or_none, batch):
+                        if lead:
+                            leads.append(lead)
+                            if len(leads) == limit:
+                                return leads
+    return leads
+
+
+def research_company(
+    name: str,
+    website: str | None,
+    target_role: str | None = None,
+    job_description: str | None = None,
+) -> dict:
+    """Collect public facts and job context without hallucination."""
+    sources: list[dict[str, str]] = []
+
+    if website:
+        try:
+            website_url, text = _website_text(website)
+            sources.append({"url": website_url, "content": text[:12000]})
+            website_host = urlparse(website_url).hostname
+            # One independent public result improves the research context without
+            # turning a 100-company run into an unbounded crawling job.
+            for result_url in _search_web(f"{name} company information"):
+                if urlparse(result_url).hostname == website_host:
+                    continue
+                try:
+                    source_url, source_text = _website_text(result_url)
+                except (httpx.HTTPError, ValueError):
+                    continue
+                if source_url != website_url:
+                    sources.append({"url": source_url, "content": source_text[:12000]})
+                    break
+        except ValueError as exc:
+            if "public IP" in str(exc) or "http" in str(exc):
+                raise
+            if job_description or target_role:
+                sources.append({"url": website, "content": f"DNS note: {exc}. Using provided job specifications."})
+            else:
+                raise
+        except httpx.HTTPError as exc:
+            if job_description or target_role:
+                sources.append({"url": website, "content": f"Web fetch notice: {exc}. Using provided job specifications."})
+            else:
+                raise ValueError(f"Failed to fetch company website: {exc}") from exc
+
+    elif job_description or target_role:
+        sources.append({"url": "user-input", "content": job_description or f"Target Role: {target_role}"})
+    else:
+        raise ValueError("Provide a company website or target role/job description.")
+
+    if job_description and not any(s.get("url") == "user-input" for s in sources):
+        sources.append({"url": "user-input", "content": job_description})
+
+    return {
+        "company": name,
+        "target_role": target_role or "",
+        "researched_at": datetime.now(timezone.utc).isoformat(),
+        "sources": sources,
+    }
+
+
+def candidates_from_zip(contents: bytes) -> list[tuple[str, str, str]]:
+    """Extract RenderCV YAML records without writing untrusted archive members to disk."""
+    if len(contents) > 20 * 1024 * 1024:
+        raise ValueError("ZIP upload exceeds 20 MB.")
+    try:
+        archive = zipfile.ZipFile(BytesIO(contents))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Upload must be a ZIP file containing RenderCV YAML files.") from exc
+    entries = [entry for entry in archive.infolist() if not entry.is_dir()]
+    if not 1 <= len(entries) <= 500:
+        raise ValueError("ZIP must contain between 1 and 500 CV files.")
+    if sum(entry.file_size for entry in entries) > 20 * 1024 * 1024:
+        raise ValueError("Uncompressed ZIP content exceeds 20 MB.")
+    result = []
+    for entry in entries:
+        if not entry.filename.lower().endswith((".yaml", ".yml")):
+            raise ValueError("ZIP may contain only .yaml or .yml CV files.")
+        raw = archive.read(entry).decode("utf-8")
+        data = yaml.safe_load(raw)
+        cv = data.get("cv", {}) if isinstance(data, dict) else {}
+        name, email = cv.get("name"), cv.get("email")
+        if not isinstance(name, str) or not name.strip() or not isinstance(email, str) or "@" not in email:
+            raise ValueError(f"{entry.filename} needs cv.name and cv.email.")
+        result.append((name.strip(), email.strip(), raw))
+    return result
+
+
+def cv_outreach_readiness_error(candidate_yaml: str) -> str | None:
+    """Return a concrete reason when a CV is too thin for unattended outreach."""
+    try:
+        document = yaml.safe_load(candidate_yaml) or {}
+    except yaml.YAMLError:
+        return "Candidate CV is not valid RenderCV YAML."
+    cv = document.get("cv", {}) if isinstance(document, dict) else {}
+    sections = cv.get("sections", {}) if isinstance(cv, dict) else {}
+    if not isinstance(cv, dict) or not cv.get("name") or not cv.get("email"):
+        return "Candidate CV needs a name and email before outreach."
+    if not isinstance(sections, dict):
+        return "Candidate CV needs populated RenderCV sections before outreach."
+    populated = [name for name, entries in sections.items() if entries]
+    if len(populated) < 2:
+        return (
+            "Candidate CV is too thin for automatic sending. Add at least one more populated section "
+            "such as skills, education, or projects."
+        )
+    return None
+
+
+def _clean_json_response(content: str) -> dict:
+    """Safely extracts JSON even if enclosed in markdown code fences."""
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
+        if match:
+            cleaned = match.group(1).strip()
+    return json.loads(cleaned)
+
+
+def _grounded_outreach_email(candidate_yaml: str, company_name: str, target_role: str | None) -> tuple[str, str]:
+    """Build a truthful email when discovery has no verified job advert."""
+    source = yaml.safe_load(candidate_yaml) or {}
+    cv = source.get("cv", {}) if isinstance(source, dict) else {}
+    sections = cv.get("sections", {}) if isinstance(cv, dict) else {}
+    experience = sections.get("experience", []) if isinstance(sections, dict) else []
+    latest = experience[0] if isinstance(experience, list) and experience and isinstance(experience[0], dict) else {}
+    name = cv.get("name", "") if isinstance(cv, dict) else ""
+    role = target_role or "an opportunity"
+    background = ""
+    if latest.get("position") and latest.get("company"):
+        background = f" My current background includes work as {latest['position']} at {latest['company']}."
+    body = (
+        f"Dear Hiring Team,\n\n"
+        f"I am writing to express my interest in {role} at {company_name}.{background} "
+        f"After reviewing your public website, I would welcome the opportunity to discuss how my experience could contribute to your team. "
+        f"I have attached my tailored CV for your consideration.\n\n"
+        f"Kind regards,\n{name}".rstrip()
+    )
+    return f"Application — {role} | {name}".rstrip(" |"), body
+
+
+def tailor(
+    candidate_yaml: str,
+    research: dict,
+    company_name: str,
+    target_role: str | None = None,
+    job_description: str | None = None,
+) -> dict:
+    if not settings.api_key:
+        raise RuntimeError("API_KEY is not configured.")
+    try:
+        parsed_source = yaml.safe_load(candidate_yaml)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Candidate RenderCV YAML is invalid: {exc}") from exc
+
+    original_name = parsed_source.get("cv", {}).get("name", "")
+
+    role_str = f" for the position of {target_role}" if target_role else ""
+    prompt = f"""You are a professional CV tailoring and job application assistant.
+Your goal is to tailor the candidate's RenderCV YAML and draft an application email specifically for {company_name}{role_str}.
+
+You MUST return a JSON object with exactly three string keys:
+1. "cv_yaml": The customized RenderCV YAML document.
+2. "email_subject": A concise, engaging, professional email subject line.
+3. "email_body": A high-converting, professional cover letter / email body.
+
+STRICT RULES:
+1. Preserve all factual candidate details. Never add fake employers, degrees, dates, metrics, skills, certifications, claims, or referrals not present in the original YAML.
+2. You may reorder sections, emphasize matching skills, and refine wording to match the company's domain and tech stack.
+3. Keep valid RenderCV YAML conforming to RenderCV specifications.
+4. The email body must be concise, professional, mention the company name, cite one evidenced company/job fact, include no aggressive pressure, and state that the tailored CV is attached in PDF format.
+
+Company: {company_name}
+{f'Target Role: {target_role}' if target_role else ''}
+{f'Job Description / Notes: {job_description}' if job_description else ''}
+Research Insights:
+{json.dumps(research)}
+
+Original RenderCV YAML:
+{candidate_yaml}"""
+
+    url = _llm_url(settings.base_url, "chat/completions")
+    headers = {"Authorization": f"Bearer {settings.api_key}"}
+
+    # First attempt with json_object format; fallback to standard if model does not support it
+    payload = {
+        "model": settings.llm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.15,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        response = _llm_request(httpx.post, url, headers=headers, json=payload)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {400, 422}:
+            # Retry without response_format
+            payload.pop("response_format", None)
+            response = _llm_request(httpx.post, url, headers=headers, json=payload)
+            response.raise_for_status()
+        else:
+            raise
+
+    content = _llm_content(response)
+    result = _clean_json_response(content)
+
+    for key in ("cv_yaml", "email_subject", "email_body"):
+        if not isinstance(result.get(key), str) or not result[key].strip():
+            raise ValueError(f"LLM response missing {key}")
+
+    tailored_data = yaml.safe_load(result["cv_yaml"])
+    if not isinstance(tailored_data, dict):
+        raise ValueError("LLM response cv_yaml must be a YAML object.")
+    source_cv = parsed_source.get("cv", {})
+    tailored_cv = tailored_data.get("cv", {})
+    source_sections = source_cv.get("sections", {}) if isinstance(source_cv, dict) else {}
+    tailored_sections = tailored_cv.get("sections", {}) if isinstance(tailored_cv, dict) else {}
+    factual_fields = ("name", "email", "phone", "location", "website")
+    source_lists_match = all(
+        isinstance(tailored_sections.get(name), list)
+        and len(tailored_sections[name]) == len(entries)
+        for name, entries in source_sections.items()
+        if isinstance(entries, list)
+    )
+    if (
+        not isinstance(tailored_cv, dict)
+        or any(tailored_cv.get(field) != source_cv.get(field) for field in factual_fields if field in source_cv)
+        or set(tailored_sections) != set(source_sections)
+        or not source_lists_match
+    ):
+        tailored_data = parsed_source
+    if original_name and tailored_data.get("cv", {}).get("name") != original_name:
+        tailored_data.setdefault("cv", {})["name"] = original_name
+    # RenderCV design is top-level. Keep the source template when a model nests or omits it.
+    if "design" in parsed_source:
+        tailored_data["design"] = parsed_source["design"]
+        if isinstance(tailored_data.get("cv"), dict):
+            tailored_data["cv"].pop("design", None)
+    result["cv_yaml"] = yaml.dump(tailored_data, sort_keys=False)
+
+    # Discovery only has public company facts, not a verified vacancy. Do not let a
+    # model invent a job advert, hiring process, or candidate achievements in email.
+    if not job_description or job_description.startswith("Companies House number:"):
+        result["email_subject"], result["email_body"] = _grounded_outreach_email(
+            candidate_yaml, company_name, target_role
+        )
+
+    return result
+
+
+def render_pdf(cv_yaml: str, campaign_id: int) -> Path:
+    output = settings.artifact_dir / str(campaign_id)
+    output.mkdir(parents=True, exist_ok=True)
+    input_path = output / "tailored_cv.yaml"
+    input_path.write_text(cv_yaml, encoding="utf-8")
+    pdf_path = output / "tailored_cv.pdf"
+
+    run = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "rendercv",
+            "render",
+            str(input_path),
+            "--pdf-path",
+            "tailored_cv.pdf",
+            "-nomd",
+            "-nohtml",
+            "-nopng",
+            "--quiet",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if run.returncode != 0 or not pdf_path.exists():
+        err_msg = run.stderr[-1500:] if run.stderr else "RenderCV exited with non-zero status"
+        raise RuntimeError(f"RenderCV failed: {err_msg}")
+    return pdf_path
+
+
+def send_email(recipient: str, subject: str, body: str, attachment: Path) -> str | None:
+    if settings.resend_api_key:
+        if not settings.resend_from:
+            raise RuntimeError("RESEND_FROM is required when using Resend.")
+        response = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+            json={
+                "from": settings.resend_from,
+                "to": [recipient],
+                "subject": subject,
+                "text": body,
+                "attachments": [{"filename": attachment.name, "content": base64.b64encode(attachment.read_bytes()).decode("ascii")}],
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("id") if isinstance(payload, dict) and isinstance(payload.get("id"), str) else None
+    if not all([settings.smtp_host, settings.smtp_from]):
+        raise RuntimeError("SMTP is not configured. Email was not sent.")
+    message = EmailMessage()
+    message["From"] = settings.smtp_from
+    message["To"] = recipient
+    message["Subject"] = subject
+    message.set_content(body)
+    message.add_attachment(
+        attachment.read_bytes(),
+        maintype="application",
+        subtype="pdf",
+        filename=attachment.name,
+    )
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as client:
+        if settings.smtp_use_tls:
+            client.starttls()
+        if settings.smtp_username:
+            client.login(settings.smtp_username, settings.smtp_password)
+        client.send_message(message)
+    return None
+
+
+def test_llm_connection(base_url: str, api_key: str, model: str) -> dict:
+    url = _llm_url(base_url, "models")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        response = _llm_request(httpx.get, url, headers=headers)
+        response.raise_for_status()
+        models = [m.get("id") for m in response.json().get("data", []) if isinstance(m, dict)]
+        return {"ok": True, "message": f"Connected successfully. Models available: {', '.join(models[:5]) or model}"}
+    except Exception as exc:
+        return {"ok": False, "message": f"Connection failed to {url}: {exc}"}
+
+
+def test_smtp_connection(
+    host: str, port: int, username: str, password: str, use_tls: bool
+) -> dict:
+    if not host:
+        return {"ok": False, "message": "SMTP host is required"}
+    try:
+        with smtplib.SMTP(host, port, timeout=10) as client:
+            client.ehlo()
+            if use_tls:
+                client.starttls()
+                client.ehlo()
+            if username and password:
+                client.login(username, password)
+        return {"ok": True, "message": f"Successfully connected to SMTP server at {host}:{port}"}
+    except Exception as exc:
+        return {"ok": False, "message": f"SMTP connection failed: {exc}"}

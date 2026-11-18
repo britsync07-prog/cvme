@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TailorMail daily outreach batch
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+Unit=tailormail-daily.service
+
+[Install]
+WantedBy=timers.target

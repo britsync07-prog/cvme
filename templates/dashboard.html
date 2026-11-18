@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TailorMail · Intelligent RenderCV Application Studio</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app-layout">
+  <header class="top-nav">
+    <div class="brand">
+      <div class="logo-mark">TM</div>
+      <div>
+        <span class="app-title">TailorMail</span>
+        <span class="app-tagline">RenderCV Builder & Tailored Outreach System</span>
+      </div>
+    </div>
+    <div class="nav-badges">
+      <span class="badge api-badge" title="Target LLM API">LLM configured</span>
+      <span class="badge smtp-badge" title="Email delivery status">{% if settings.smtp_host or settings.resend_api_key %}Email configured{% else %}Email unconfigured{% endif %}</span>
+    </div>
+  </header>
+
+  <nav class="tab-bar">
+    <a href="/?tab=applications" class="tab-item {% if active_tab == 'applications' %}active{% endif %}">
+      Applications
+      <span class="tab-count">{{ campaigns|length }}</span>
+    </a>
+    <a href="/?tab=new" class="tab-item {% if active_tab == 'new' %}active{% endif %}">
+      New Application
+    </a>
+    <a href="/?tab=leads" class="tab-item {% if active_tab == 'leads' %}active{% endif %}">Lead discovery</a>
+    <a href="/?tab=candidates" class="tab-item {% if active_tab == 'candidates' %}active{% endif %}">
+      Candidates
+      <span class="tab-count">{{ candidates|length }}</span>
+    </a>
+    <a href="/?tab=settings" class="tab-item {% if active_tab == 'settings' %}active{% endif %}">
+      System Settings
+    </a>
+  </nav>
+
+  <main class="main-content">
+    {% if active_tab == 'applications' %}
+    <!-- APPLICATIONS TAB -->
+    <div class="dashboard-title">
+      <h1>Applications</h1>
+      <p>Track company research, tailored CVs, email drafts, and daily delivery progress.</p>
+    </div>
+    <section class="metrics-grid">
+      <div class="metric-card">
+        <span class="metric-label">Total Applications</span>
+        <strong class="metric-value">{{ campaigns|length }}</strong>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Draft / Pending</span>
+        <strong class="metric-value">{{ counts.get('draft', 0) }}</strong>
+      </div>
+      <div class="metric-card highlight-ready">
+        <span class="metric-label">Ready for Review</span>
+        <strong class="metric-value">{{ counts.get('ready', 0) }}</strong>
+      </div>
+      <div class="metric-card highlight-sent">
+        <span class="metric-label">Emails Sent</span>
+        <strong class="metric-value">{{ counts.get('sent', 0) }}</strong>
+      </div>
+      <div class="metric-card highlight-sent">
+        <span class="metric-label">Emails Sent Today</span>
+        <strong class="metric-value">{{ daily_sent }} / {{ settings.outreach_daily_limit }}</strong>
+        <span class="metric-subtitle">{{ daily_remaining }} remaining</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-label">Total Candidates</span>
+        <strong class="metric-value">{{ candidates|length }}</strong>
+      </div>
+    </section>
+
+    <div class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>Target Company Applications</h2>
+          <p class="subtitle">Each application conducts company research, tailors the CV truthfully using RenderCV, and prepares a tailored email.</p>
+        </div>
+        <a href="/?tab=new" class="button primary">+ New Application</a>
+      </div>
+
+      <div class="table-responsive">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Candidate</th>
+              <th>Target Company</th>
+              <th>Role</th>
+              <th>Recipient</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for c in campaigns %}
+            <tr>
+              <td><strong>{{ c.candidate.name }}</strong></td>
+              <td>
+                <div class="company-cell">
+                  <span class="company-name">{{ c.company_name }}</span>
+                  {% if c.company_url %}
+                  <a href="{{ c.company_url }}" target="_blank" rel="noreferrer" class="site-link">{{ c.company_url }}</a>
+                  {% endif %}
+                </div>
+              </td>
+              <td>{{ c.target_role or '—' }}</td>
+              <td><code>{{ c.recipient_email }}</code></td>
+              <td><span class="status-badge status-{{ c.status }}">{{ c.status }}</span></td>
+              <td>{{ c.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+              <td>
+                <div class="action-cell">
+                  <a href="/campaigns/{{ c.id }}" class="button small secondary">Open</a>
+                  {% if c.artifact_path %}
+                  <a href="/campaigns/{{ c.id }}/cv.pdf" class="button small ghost" title="Download RenderCV PDF">PDF</a>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="7" class="empty-state">
+                <div class="empty-icon">📂</div>
+                <h3>No applications created yet</h3>
+                <p>Add candidate profiles and launch your first company-tailored CV workflow.</p>
+                <a href="/?tab=new" class="button primary">Create First Application</a>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    {% elif active_tab == 'new' %}
+    <!-- NEW APPLICATION TAB -->
+    <div class="panel form-panel">
+      <div class="panel-header">
+        <div>
+          <h2>Target New Company & Role</h2>
+          <p class="subtitle">1st: Research company facts & requirements. 2nd: Tailor CV truthfully via RenderCV. 3rd: Review & send.</p>
+        </div>
+      </div>
+
+      {% if candidates %}
+      <form action="/campaigns" method="post" class="standard-form">
+        <div class="form-row">
+          <label class="field">
+            <span>Candidate Profile <strong class="req">*</strong></span>
+            <select name="candidate_id" required>
+              {% for c in candidates %}
+              <option value="{{ c.id }}">{{ c.name }} ({{ c.email }})</option>
+              {% endfor %}
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Target Company Name <strong class="req">*</strong></span>
+            <input name="company_name" placeholder="e.g. Acme Corp or DeepMind" required>
+          </label>
+        </div>
+
+        <div class="form-row">
+          <label class="field">
+            <span>Target Role / Position</span>
+            <input name="target_role" placeholder="e.g. Senior Backend Engineer / ML Ops">
+          </label>
+
+          <label class="field">
+            <span>Hiring Contact / Recipient Email <strong class="req">*</strong></span>
+            <input name="recipient_email" type="email" placeholder="jobs@company.com" required>
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Company Website URL <small>(used for live research & requirement gathering)</small></span>
+          <input name="company_url" type="url" placeholder="https://example.com">
+        </label>
+
+        <label class="field">
+          <span>Job Description / Specific Requirements & Focus Notes</span>
+          <textarea name="job_description" rows="5" placeholder="Paste the job description, required tech stack, or specific highlights here. The system uses this alongside company research to tailor the CV and email."></textarea>
+        </label>
+
+        <div class="form-options">
+          <label class="checkbox-label">
+            <input type="checkbox" name="auto_prepare" value="true" checked>
+            <span>Automatically run Research, Tailoring, and RenderCV PDF compilation now</span>
+          </label>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="button primary">Start Application Workflow</button>
+          <a href="/?tab=applications" class="button secondary">Cancel</a>
+        </div>
+      </form>
+      {% else %}
+      <div class="empty-state">
+        <div class="empty-icon">👥</div>
+        <h3>No candidates found</h3>
+        <p>You need to add at least one candidate CV before launching an application.</p>
+        <a href="/?tab=candidates" class="button primary">Add Candidates Now</a>
+      </div>
+      {% endif %}
+    </div>
+
+    {% elif active_tab == 'leads' %}
+    <div class="panel form-panel">
+      <div class="panel-header">
+        <div>
+          <h1>Discover a UK company lead</h1>
+          <p class="subtitle">Companies House finds an active company. DuckDuckGo and public company pages find its official website and published generic mailbox.</p>
+        </div>
+      </div>
+      {% if candidates %}
+      <form action="/leads/discover" method="post" class="standard-form">
+        <div class="form-row">
+          <label class="field"><span>Candidate</span><select name="candidate_id" required>{% for c in candidates %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></label>
+          <label class="field"><span>Companies House search</span><input name="query" placeholder="e.g. software, consulting, engineering" required></label>
+        </div>
+        <label class="field"><span>Target role</span><input name="target_role" placeholder="e.g. Software Engineer"></label>
+        <button type="submit" class="button primary">Discover, research, and prepare</button>
+      </form>
+
+      <form action="/leads/batch" method="post" class="standard-form">
+        <h2>Prepare a daily batch</h2>
+          <p class="subtitle">Creates up to 100 new company campaigns from Companies House queries. Separate alternative searches with semicolons; existing company names and numbers are skipped.</p>
+        <div class="form-row">
+          <label class="field"><span>Candidate</span><select name="candidate_id" required>{% for c in candidates %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></label>
+          <label class="field"><span>Companies House search</span><input name="query" placeholder="e.g. software, consulting, engineering" required></label>
+        </div>
+        <div class="form-row">
+          <label class="field"><span>Target role</span><input name="target_role" placeholder="e.g. Software Engineer"></label>
+          <label class="field"><span>Maximum campaigns</span><input name="limit" type="number" min="1" max="100" value="100"></label>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" name="send_when_ready" value="true"><span>Send each campaign after it is prepared.</span></label>
+        <button type="submit" class="button primary">Run batch</button>
+      </form>
+      {% else %}
+      <p>Add a candidate first. A candidate CV is required before a tailored application can be created.</p>
+      {% endif %}
+    </div>
+
+    {% elif active_tab == 'candidates' %}
+    <!-- CANDIDATES TAB -->
+    <div class="grid-2col">
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Add Single Candidate</h2>
+            <p class="subtitle">Input candidate info with RenderCV YAML.</p>
+          </div>
+        </div>
+
+        <form action="/candidates" method="post" class="standard-form">
+          <label class="field">
+            <span>Candidate Full Name <strong class="req">*</strong></span>
+            <input name="name" placeholder="e.g. Alex Johnson" required>
+          </label>
+
+          <label class="field">
+            <span>Candidate Email <strong class="req">*</strong></span>
+            <input name="email" type="email" placeholder="alex@example.com" required>
+          </label>
+
+          <label class="field">
+            <span>RenderCV YAML Profile <strong class="req">*</strong></span>
+            <textarea name="cv_yaml" rows="12" placeholder="cv:&#10;  name: Alex Johnson&#10;  email: alex@example.com&#10;  location: San Francisco, CA&#10;  sections:&#10;    experience:&#10;      - company: TechCorp&#10;        position: Software Engineer&#10;        start_date: 2022-01&#10;        end_date: present&#10;        highlights:&#10;          - Built scalable backend microservices." required></textarea>
+          </label>
+
+          <label class="checkbox-label">
+            <input type="checkbox" name="consent" value="true" required>
+            <span>Candidate explicitly consented to CV processing and career applications.</span>
+          </label>
+
+          <button type="submit" class="button primary">Save Candidate</button>
+        </form>
+
+        <div class="bulk-box">
+          <h3>📦 Bulk Import (ZIP of YAML files)</h3>
+          <p>Upload a ZIP file containing up to 500 RenderCV <code>.yaml</code> or <code>.yml</code> files. Each file must define <code>cv.name</code> and <code>cv.email</code>.</p>
+          <form action="/candidates/import" method="post" enctype="multipart/form-data" class="standard-form">
+            <label class="field">
+              <span>Select ZIP Archive</span>
+              <input type="file" name="archive" accept=".zip" required>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" name="consent" value="true" required>
+              <span>All candidates in archive consented to CV processing.</span>
+            </label>
+            <button type="submit" class="button secondary">Upload & Import Batch</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Candidate Roster ({{ candidates|length }})</h2>
+            <p class="subtitle">Manage talent profiles available for tailored applications.</p>
+          </div>
+        </div>
+
+        <div class="candidate-list">
+          {% for c in candidates %}
+          <div class="candidate-card">
+            <div class="candidate-meta">
+              <h4>{{ c.name }}</h4>
+              <p class="email-sub">{{ c.email }}</p>
+              <div class="pill-group">
+                <span class="pill">{{ c.campaigns|length }} application{{ 's' if c.campaigns|length != 1 else '' }}</span>
+                <span class="pill-date">Registered {{ c.created_at.strftime('%Y-%m-%d') }}</span>
+              </div>
+            </div>
+            <div class="candidate-actions">
+              <a href="/?tab=new" class="button small primary">Apply for Job</a>
+              <details class="cv-peek">
+                <summary class="button small secondary">View CV</summary>
+                <pre class="yaml-peek">{{ c.cv_yaml }}</pre>
+              </details>
+              <form action="/candidates/{{ c.id }}/delete" method="post" onsubmit="return confirm('Delete this candidate and all their applications?');">
+                <button type="submit" class="button small danger">Delete</button>
+              </form>
+            </div>
+          </div>
+          {% else %}
+          <div class="empty-state">
+            <p>No candidates added yet. Use the form on the left to add your first candidate or import a batch ZIP.</p>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    {% elif active_tab == 'settings' %}
+    <!-- SETTINGS TAB -->
+    <div class="panel form-panel">
+      <div class="panel-header">
+        <div>
+          <h2>System Configuration & Integrations</h2>
+          <p class="subtitle">Configure the LLM tailoring API (BASE_URL=http://127.0.0.1:31415), SMTP delivery credentials, and research providers.</p>
+        </div>
+      </div>
+
+      <form action="/settings" method="post" class="standard-form">
+        <div class="settings-section">
+          <h3>🤖 LLM Intelligence Engine</h3>
+          <p class="subtitle">Connects to your local or hosted OpenAI-compatible endpoint for truthful CV adaptation.</p>
+
+          <div class="form-row">
+            <label class="field">
+              <span>API Base URL <strong class="req">*</strong></span>
+              <input name="base_url" id="base_url" value="{{ settings.base_url }}" placeholder="http://127.0.0.1:31415" required>
+            </label>
+            <label class="field">
+              <span>API Key</span>
+              <input name="api_key" id="api_key" type="password" value="{{ settings.api_key }}" placeholder="e.g. freellmapi-key or local-token">
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label class="field">
+              <span>Model Identifier</span>
+              <input name="llm_model" id="llm_model" value="{{ settings.llm_model }}" placeholder="local-model or auto">
+            </label>
+            <div class="field align-end">
+              <button type="button" class="button secondary" onclick="testLLM()">⚡ Test LLM Endpoint</button>
+            </div>
+          </div>
+          <div id="llm-test-result" class="test-feedback"></div>
+        </div>
+
+        <div class="settings-section">
+          <h3>✉️ Resend Email Delivery</h3>
+          <p class="subtitle">Resend sends approved application packages with the tailored PDF attached. Each campaign keeps recipient, final message, send time, and audit trail.</p>
+
+          <div class="form-row">
+            <label class="field">
+              <span>Resend API Key</span>
+              <input name="resend_api_key" type="password" value="{{ settings.resend_api_key }}" placeholder="re_...">
+            </label>
+            <label class="field">
+              <span>Verified From Address</span>
+              <input name="resend_from" type="text" value="{{ settings.resend_from }}" placeholder="Applications <jobs@yourdomain.com>">
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label class="field">
+              <span>SMTP Host</span>
+              <input name="smtp_host" id="smtp_host" value="{{ settings.smtp_host }}" placeholder="smtp.gmail.com / mail.example.com">
+            </label>
+            <label class="field">
+              <span>SMTP Port</span>
+              <input name="smtp_port" id="smtp_port" type="number" value="{{ settings.smtp_port }}">
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label class="field">
+              <span>SMTP Username</span>
+              <input name="smtp_username" id="smtp_username" value="{{ settings.smtp_username }}" placeholder="username / email">
+            </label>
+            <label class="field">
+              <span>SMTP Password</span>
+              <input name="smtp_password" id="smtp_password" type="password" value="{{ settings.smtp_password }}">
+            </label>
+          </div>
+
+          <div class="form-row">
+            <label class="field">
+              <span>From Email Address</span>
+              <input name="smtp_from" id="smtp_from" type="email" value="{{ settings.smtp_from }}" placeholder="you@domain.com">
+            </label>
+            <div class="field">
+              <span>Connection Security</span>
+              <label class="checkbox-label" style="margin-top:10px;">
+                <input type="checkbox" name="smtp_use_tls" id="smtp_use_tls" value="true" {% if settings.smtp_use_tls %}checked{% endif %}>
+                <span>Enable TLS (Recommended for Port 587)</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="field">
+              <button type="button" class="button secondary" onclick="testSMTP()">⚡ Test SMTP Handshake</button>
+            </div>
+          </div>
+          <div id="smtp-test-result" class="test-feedback"></div>
+        </div>
+
+        <div class="settings-section">
+          <h3>UK company discovery</h3>
+          <p class="subtitle">Uses the free Companies House API plus DuckDuckGo and public company websites. No paid search API is required.</p>
+          <label class="field"><span>Companies House REST API key</span><input name="companies_house_api_key" type="password" value="{{ settings.companies_house_api_key }}"></label>
+        </div>
+
+        <div class="settings-section">
+          <h3>Public web research</h3>
+          <p class="subtitle">Research comes from the public company website and its published contact pages.</p>
+        </div>
+
+        <div class="settings-section">
+          <h3>Lead intake and outreach policy</h3>
+          <p class="subtitle">The scheduled runner uses Companies House, DuckDuckGo, public company websites, your local AI endpoint, RenderCV, and your configured email sender.</p>
+          <div class="form-row">
+            <label class="field">
+              <span>Scheduled candidate</span>
+              <select name="outreach_candidate_id">{% for c in candidates %}<option value="{{ c.id }}" {% if c.id == settings.outreach_candidate_id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}</select>
+            </label>
+            <label class="field">
+              <span>Daily lead limit</span>
+              <input name="outreach_daily_limit" type="number" min="1" max="100" value="{{ settings.outreach_daily_limit }}">
+            </label>
+          </div>
+          <div class="form-row">
+            <label class="field">
+              <span>Companies House query</span>
+              <input name="outreach_query" value="{{ settings.outreach_query }}" placeholder="e.g. software, consulting, engineering">
+            </label>
+            <label class="field">
+              <span>Target role</span>
+              <input name="outreach_target_role" value="{{ settings.outreach_target_role }}" placeholder="e.g. Software Engineer">
+            </label>
+          </div>
+          <label class="field"><span>Daily schedule timezone</span><input name="outreach_timezone" value="{{ settings.outreach_timezone }}" placeholder="e.g. Asia/Dhaka"></label>
+          <label class="checkbox-label"><input name="outreach_auto_send" type="checkbox" value="true" {% if settings.outreach_auto_send %}checked{% endif %}><span>Automatically send after a successful preparation.</span></label>
+          <input type="hidden" name="outreach_policy" value="review_required">
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="button primary">Save Settings</button>
+        </div>
+      </form>
+    </div>
+    {% endif %}
+  </main>
+</div>
+
+<script>
+async function testLLM() {
+  const el = document.getElementById('llm-test-result');
+  el.className = 'test-feedback pending';
+  el.innerText = 'Testing connection to ' + document.getElementById('base_url').value + '...';
+  const data = new FormData();
+  data.append('base_url', document.getElementById('base_url').value);
+  data.append('api_key', document.getElementById('api_key').value);
+  data.append('llm_model', document.getElementById('llm_model').value);
+  try {
+    const res = await fetch('/settings/test-llm', { method: 'POST', body: data });
+    const json = await res.json();
+    if (json.ok) {
+      el.className = 'test-feedback success';
+      el.innerText = '✓ ' + json.message;
+    } else {
+      el.className = 'test-feedback error';
+      el.innerText = '✗ ' + json.message;
+    }
+  } catch (err) {
+    el.className = 'test-feedback error';
+    el.innerText = '✗ Network request failed: ' + err.message;
+  }
+}
+
+async function testSMTP() {
+  const el = document.getElementById('smtp-test-result');
+  el.className = 'test-feedback pending';
+  el.innerText = 'Connecting to SMTP host...';
+  const data = new FormData();
+  data.append('smtp_host', document.getElementById('smtp_host').value);
+  data.append('smtp_port', document.getElementById('smtp_port').value);
+  data.append('smtp_username', document.getElementById('smtp_username').value);
+  data.append('smtp_password', document.getElementById('smtp_password').value);
+  if (document.getElementById('smtp_use_tls').checked) {
+    data.append('smtp_use_tls', 'true');
+  }
+  try {
+    const res = await fetch('/settings/test-smtp', { method: 'POST', body: data });
+    const json = await res.json();
+    if (json.ok) {
+      el.className = 'test-feedback success';
+      el.innerText = '✓ ' + json.message;
+    } else {
+      el.className = 'test-feedback error';
+      el.innerText = '✗ ' + json.message;
+    }
+  } catch (err) {
+    el.className = 'test-feedback error';
+    el.innerText = '✗ Network request failed: ' + err.message;
+  }
+}
+</script>
+</body>
+</html>

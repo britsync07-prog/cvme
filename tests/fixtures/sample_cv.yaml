@@ -1,0 +1,18 @@
+cv:
+  name: Test Person
+  location: Dhaka, Bangladesh
+  email: test@example.com
+  sections:
+    experience:
+      - company: Example Systems
+        position: Software Engineer
+        start_date: 2023-01
+        end_date: present
+        highlights:
+          - Built reliable Python services.
+          - Improved automated test coverage for backend services.
+    skills:
+      - label: Languages
+        details: Python, SQL
+design:
+  theme: classic

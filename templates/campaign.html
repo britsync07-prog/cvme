@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ campaign.company_name }} · TailorMail Application</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app-layout">
+  <header class="top-nav">
+    <div class="brand">
+      <div class="logo-mark">TM</div>
+      <div>
+        <span class="app-title">TailorMail</span>
+        <span class="app-tagline">Application Studio</span>
+      </div>
+    </div>
+    <a href="/?tab=applications" class="button secondary small">Back to applications</a>
+  </header>
+
+  <main class="main-content">
+    <div class="campaign-header">
+      <div>
+        <div class="meta-row">
+          <h1 class="target-company">{{ campaign.company_name }}</h1>
+          {% if campaign.target_role %}
+          <span class="pill pill-role">{{ campaign.target_role }}</span>
+          {% endif %}
+          <span class="status-badge status-{{ campaign.status }}">{{ campaign.status }}</span>
+        </div>
+        <p class="subtitle">
+          Candidate: <strong>{{ campaign.candidate.name }}</strong> · 
+          Recipient: <code>{{ campaign.recipient_email }}</code>
+          {% if campaign.company_url %}
+          · Website: <a href="{{ campaign.company_url }}" target="_blank" rel="noreferrer">{{ campaign.company_url }}</a>
+          {% endif %}
+        </p>
+      </div>
+
+      <div class="header-actions">
+        {% if campaign.status in ['ready', 'sent'] and campaign.artifact_path %}
+        <a href="/campaigns/{{ campaign.id }}/cv.pdf" class="button primary">Download RenderCV PDF</a>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Stepper indicator -->
+    <div class="stepper">
+      <div class="step complete">
+        <span class="step-num">1</span>
+        <span class="step-label">Application Created</span>
+      </div>
+      <div class="step {% if campaign.status in ['ready', 'sending', 'sent'] %}complete{% elif campaign.status == 'researching' %}active{% else %}pending{% endif %}">
+        <span class="step-num">2</span>
+        <span class="step-label">Research & RenderCV Tailor</span>
+      </div>
+      <div class="step {% if campaign.status in ['ready', 'sending', 'sent'] %}complete{% else %}pending{% endif %}">
+        <span class="step-num">3</span>
+        <span class="step-label">Review CV & Email</span>
+      </div>
+      <div class="step {% if campaign.status == 'sent' %}complete{% elif campaign.status == 'sending' %}active{% else %}pending{% endif %}">
+        <span class="step-num">4</span>
+        <span class="step-label">Email Delivery</span>
+      </div>
+    </div>
+
+    {% if campaign.status in ['draft', 'failed'] %}
+    <!-- PREPARATION ACTION CARD -->
+    <div class="panel action-banner">
+      <div class="action-info">
+        <h2>Ready to tailor this application</h2>
+        <p>This automated workflow will:</p>
+        <ol class="action-steps">
+          <li><strong>Research Company:</strong> Analyze public facts, website, mission, and provided job requirements.</li>
+          <li><strong>LLM Truthful Tailoring:</strong> Restructure sections, emphasize matching skills, and draft an engaging cover letter.</li>
+          <li><strong>RenderCV PDF Compilation:</strong> Compile the tailored YAML into a professional PDF using RenderCV.</li>
+        </ol>
+      </div>
+      <form action="/campaigns/{{ campaign.id }}/prepare" method="post">
+        <button type="submit" class="button primary large">Research and tailor CV</button>
+      </form>
+    </div>
+    {% endif %}
+
+    {% if campaign.status in ['ready', 'sent', 'send_uncertain'] %}
+    <!-- READY OR SENT SPLIT SCREEN -->
+    <div class="grid-2col">
+      <!-- LEFT: RENDERCV TAILORED PDF & YAML -->
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Tailored RenderCV resume</h2>
+            <p class="subtitle">Generated directly by RenderCV v2.8 compiler.</p>
+          </div>
+          <a href="/campaigns/{{ campaign.id }}/cv.pdf" class="button small secondary">Download PDF</a>
+        </div>
+
+        <div class="pdf-container">
+          <iframe src="/campaigns/{{ campaign.id }}/preview.pdf" class="pdf-viewer" title="Tailored CV Preview"></iframe>
+        </div>
+
+        <details class="accordion-box">
+          <summary>View Generated RenderCV YAML Source</summary>
+          <pre class="code-block">{{ campaign.tailored_yaml }}</pre>
+        </details>
+
+        {% if campaign.research %}
+        <details class="accordion-box" open>
+          <summary>Company research insights ({{ campaign.research.sources|length }} sources)</summary>
+          <div class="research-body">
+            {% for s in campaign.research.sources %}
+            <div class="source-item">
+              <span class="source-url"><strong>Source:</strong> <code>{{ s.url }}</code></span>
+              <p class="source-text">{{ s.content[:500] }}{% if s.content|length > 500 %}...{% endif %}</p>
+            </div>
+            {% endfor %}
+          </div>
+        </details>
+        {% endif %}
+      </div>
+
+      <!-- RIGHT: CUSTOMIZED EMAIL & SEND CONTROLS -->
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Application email outreach</h2>
+            <p class="subtitle">Tailored cover email mentioning company facts and role requirements.</p>
+          </div>
+        </div>
+
+        {% if campaign.status == 'ready' %}
+        <!-- EDITABLE EMAIL FORM -->
+        <form action="/campaigns/{{ campaign.id }}/update-email" method="post" class="standard-form">
+          <div class="email-meta-header">
+            <span class="meta-tag"><strong>To:</strong> <code>{{ campaign.recipient_email }}</code></span>
+            <span class="meta-tag"><strong>Attachment:</strong> {{ campaign.candidate.name }}-{{ campaign.company_name }}-CV.pdf</span>
+          </div>
+
+          <label class="field">
+            <span>Subject Line</span>
+            <input name="email_subject" value="{{ campaign.email_subject or '' }}" required>
+          </label>
+
+          <label class="field">
+            <span>Email Message</span>
+            <textarea name="email_body" rows="12" required>{{ campaign.email_body or '' }}</textarea>
+          </label>
+
+          <div class="form-row">
+            <button type="submit" class="button secondary small">Save email changes</button>
+          </div>
+        </form>
+
+        <div class="send-approval-card">
+          <h2>Send application email</h2>
+          {% if cv_readiness_error %}
+          <div class="uncertain-box">
+            <strong>Sending blocked:</strong> {{ cv_readiness_error }}
+          </div>
+          {% else %}
+          <p>Please review the PDF and email carefully. Clicking send delivers one email with the tailored PDF attached directly to <code>{{ campaign.recipient_email }}</code>.</p>
+          
+          <form action="/campaigns/{{ campaign.id }}/send" method="post">
+            <label class="checkbox-label send-check">
+              <input type="checkbox" name="approved" value="true" required>
+              <span><strong>I explicitly approve sending this tailored application.</strong> (Irreversible; protected against duplicate sending).</span>
+            </label>
+            <button type="submit" class="button primary send-btn">Send application email</button>
+          </form>
+          {% endif %}
+        </div>
+
+        {% elif campaign.status == 'sent' %}
+        <div class="sent-success-box">
+          <div class="success-icon">✓</div>
+          <div>
+            <h4>Email Successfully Delivered</h4>
+            <p>Sent to <strong>{{ campaign.recipient_email }}</strong> on {{ campaign.sent_at.strftime('%Y-%m-%d %H:%M UTC') }}.</p>
+            <p class="lock-notice">This campaign is locked to prevent duplicate emails.</p>
+          </div>
+        </div>
+
+        <div class="email-preview-locked">
+          <p><strong>Subject:</strong> {{ campaign.email_subject }}</p>
+          <div class="mail-body-display">{{ campaign.email_body }}</div>
+        </div>
+
+        {% elif campaign.status == 'send_uncertain' %}
+        <div class="uncertain-box">
+          <h2>Delivery status uncertain</h2>
+          <p>The email provider did not confirm clean receipt. To prevent duplicate outbound emails to the hiring manager, the send action remains locked.</p>
+        </div>
+        {% endif %}
+
+        <div class="audit-section">
+          <h2>Audit trail</h2>
+          <div class="audit-timeline">
+            {% for e in events %}
+            <div class="audit-entry">
+              <span class="audit-time">{{ e.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+              <span class="audit-action">{{ e.action }}</span>
+              <p class="audit-detail">{{ e.detail }}</p>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="campaign-footer">
+      <form action="/campaigns/{{ campaign.id }}/delete" method="post" onsubmit="return confirm('Delete this application record?');">
+        <button type="submit" class="button ghost danger">Delete Application</button>
+      </form>
+    </div>
+  </main>
+</div>
+</body>
+</html>

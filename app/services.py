@@ -7,7 +7,7 @@ import socket
 import subprocess
 import sys
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from io import BytesIO
@@ -208,7 +208,8 @@ def discover_company_leads(
                     except (httpx.HTTPError, ValueError):
                         return None
                 with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                    for lead in executor.map(discover_or_none, batch):
+                    for future in as_completed([executor.submit(discover_or_none, company) for company in batch]):
+                        lead = future.result()
                         if lead:
                             leads.append(lead)
                             if len(leads) == limit:

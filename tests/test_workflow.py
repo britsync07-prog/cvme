@@ -318,11 +318,11 @@ def test_daily_worker_fails_when_auto_send_misses_target(monkeypatch):
     monkeypatch.setattr(
         daily_outreach,
         "discover_lead_batch",
-        lambda **kwargs: JSONResponse({"discovered": 1, "completed": 1, "sent": 1}),
+        lambda **kwargs: JSONResponse({"discovered": 0, "completed": 0, "sent": 0}),
     )
     monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: 99)
 
-    with pytest.raises(SystemExit, match="99 delivery slots remain"):
+    with pytest.raises(SystemExit, match="99 slots remain"):
         daily_outreach.main()
 
 
@@ -350,9 +350,30 @@ def test_daily_worker_accepts_completed_daily_send_target(monkeypatch):
         "discover_lead_batch",
         lambda **kwargs: JSONResponse({"discovered": 100, "completed": 100, "sent": 100}),
     )
-    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: 0)
+    remaining = iter([100, 0])
+    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: next(remaining))
 
     daily_outreach.main()
+
+
+def test_daily_worker_retries_until_daily_send_target_is_met(monkeypatch):
+    _configure_daily_worker(monkeypatch, _outreach_ready_candidate_id())
+    limits = []
+    results = iter([
+        JSONResponse({"discovered": 40, "completed": 40, "sent": 40}),
+        JSONResponse({"discovered": 60, "completed": 60, "sent": 60}),
+    ])
+    remaining = iter([100, 60, 0])
+    monkeypatch.setattr(
+        daily_outreach,
+        "discover_lead_batch",
+        lambda **kwargs: (limits.append(kwargs["limit"]) or next(results)),
+    )
+    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: next(remaining))
+
+    daily_outreach.main()
+
+    assert limits == [100, 60]
 
 
 def test_search_web_uses_duckduckgo_lite_when_html_has_no_results(monkeypatch):

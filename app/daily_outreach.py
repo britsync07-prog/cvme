@@ -46,24 +46,34 @@ def main() -> None:
     errors = production_preflight_errors()
     if errors:
         raise SystemExit("\n".join(errors))
-    response = discover_lead_batch(
-        candidate_id=settings.outreach_candidate_id,
-        query=settings.outreach_query,
-        target_role=settings.outreach_target_role,
-        limit=settings.outreach_daily_limit,
-        send_when_ready=settings.outreach_auto_send,
-    )
-    result = json.loads(response.body)
-    print(json.dumps(result))
-    if settings.outreach_auto_send:
+    totals = {"discovered": 0, "completed": 0, "sent": 0}
+    while True:
         with SessionLocal() as db:
             remaining = remaining_daily_send_budget(db)
-        if remaining:
-            raise SystemExit(f"Daily send target missed: {remaining} delivery slots remain.")
-    elif result["completed"] < settings.outreach_daily_limit:
-        raise SystemExit(
-            f"Daily preparation target missed: prepared {result['completed']} of {settings.outreach_daily_limit}."
+        if remaining == 0:
+            print(json.dumps(totals))
+            return
+        response = discover_lead_batch(
+            candidate_id=settings.outreach_candidate_id,
+            query=settings.outreach_query,
+            target_role=settings.outreach_target_role,
+            limit=remaining,
+            send_when_ready=settings.outreach_auto_send,
         )
+        result = json.loads(response.body)
+        for key in totals:
+            totals[key] += result[key]
+        if not settings.outreach_auto_send:
+            print(json.dumps(totals))
+            if result["completed"] < settings.outreach_daily_limit:
+                raise SystemExit(
+                    f"Daily preparation target missed: prepared {result['completed']} of {settings.outreach_daily_limit}."
+                )
+            return
+        if result["completed"] == 0:
+            print(json.dumps(totals))
+            action = "send" if settings.outreach_auto_send else "preparation"
+            raise SystemExit(f"Daily {action} target missed: {remaining} slots remain; no new verified leads were available.")
 
 
 if __name__ == "__main__":

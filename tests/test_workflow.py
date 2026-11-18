@@ -476,9 +476,9 @@ def test_campaign_page_explains_thin_cv_send_block():
 
 
 def test_tailor_prompt_guardrails(monkeypatch):
-    source = "cv:\n  name: Test Person\n  email: test@example.com\n  sections: {}\n"
+    source = "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Original\n  sections: {}\n"
     payload = {
-        "cv_yaml": source,
+        "cv_yaml": "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Backend Engineer\n  sections: {}\n",
         "email_subject": "Application – Backend Engineer",
         "email_body": "Dear Hiring Team, My CV is attached.",
     }
@@ -537,7 +537,7 @@ def test_discovery_email_is_grounded_in_candidate_facts(monkeypatch):
 
 
 def test_tailor_accepts_sse_responses(monkeypatch):
-    source = "cv:\n  name: Test Person\n  email: test@example.com\n  sections: {}\n"
+    source = "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Original\n  sections: {}\n"
     streamed = "\n".join(
         [
             'data: {"choices":[{"delta":{"content":"{\\\"cv_yaml\\\": \\\"cv:\\\\n  name: Test Person\\\\n  email: test@example.com\\\\n  sections: {}\\\\n\\\", \\\"email_subject\\\": \\\"Application\\\", \\\"email_body\\\": \\\"Attached.\\\"}"}}]}',
@@ -563,9 +563,9 @@ def test_tailor_accepts_sse_responses(monkeypatch):
 
 
 def test_tailor_restores_the_source_rendercv_design(monkeypatch):
-    source = "cv:\n  name: Test Person\n  email: test@example.com\n  sections: {}\ndesign:\n  theme: classic\n"
+    source = "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Original\n  sections: {}\ndesign:\n  theme: classic\n"
     payload = {
-        "cv_yaml": "cv:\n  name: Test Person\n  email: test@example.com\n  sections: {}\n  design:\n    theme: modern\n",
+        "cv_yaml": "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Tailored\n  sections: {}\n  design:\n    theme: modern\n",
         "email_subject": "Application",
         "email_body": "Attached.",
     }

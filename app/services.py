@@ -424,11 +424,7 @@ Original RenderCV YAML:
             raise
 
     content = _llm_content(response)
-    try:
-        result = _clean_json_response(content)
-    except (json.JSONDecodeError, ValueError):
-        subject, body = _grounded_outreach_email(candidate_yaml, company_name, target_role)
-        result = {"cv_yaml": candidate_yaml, "email_subject": subject, "email_body": body}
+    result = _clean_json_response(content)
 
     for key in ("cv_yaml", "email_subject", "email_body"):
         if not isinstance(result.get(key), str) or not result[key].strip():
@@ -457,9 +453,8 @@ Original RenderCV YAML:
         tailored_data = parsed_source
     if original_name and tailored_data.get("cv", {}).get("name") != original_name:
         tailored_data.setdefault("cv", {})["name"] = original_name
-    headline = tailored_data.get("cv", {}).get("headline")
-    if isinstance(headline, str) and company_name.casefold() not in headline.casefold():
-        tailored_data["cv"]["headline"] = f"{headline} | Targeted for {company_name}"
+    if yaml.safe_dump(tailored_data, sort_keys=False) == yaml.safe_dump(parsed_source, sort_keys=False):
+        raise ValueError("AI returned an unchanged CV; company-specific tailoring is required.")
     # RenderCV design is top-level. Keep the source template when a model nests or omits it.
     if "design" in parsed_source:
         tailored_data["design"] = parsed_source["design"]

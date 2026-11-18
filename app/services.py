@@ -231,18 +231,24 @@ def research_company(
             website_url, text = _website_text(website)
             sources.append({"url": website_url, "content": text[:12000]})
             website_host = urlparse(website_url).hostname
-            # One independent public result improves the research context without
-            # turning a 100-company run into an unbounded crawling job.
-            for result_url in _search_web(f"{name} company information"):
-                if urlparse(result_url).hostname == website_host:
-                    continue
-                try:
-                    source_url, source_text = _website_text(result_url)
-                except (httpx.HTTPError, ValueError):
-                    continue
-                if source_url != website_url:
-                    sources.append({"url": source_url, "content": source_text[:12000]})
-                    break
+            # Collect evidence about both the business and what it hires for.
+            seen_sources = {website_url}
+            research_queries = [
+                f"{name} company services technology",
+                f"{name} careers jobs hiring {target_role or ''}",
+                f"{name} company information",
+            ]
+            for query in research_queries:
+                for result_url in _search_web(query):
+                    if len(sources) >= 4 or urlparse(result_url).hostname == website_host:
+                        continue
+                    try:
+                        source_url, source_text = _website_text(result_url)
+                    except (httpx.HTTPError, ValueError):
+                        continue
+                    if source_url not in seen_sources:
+                        seen_sources.add(source_url)
+                        sources.append({"url": source_url, "content": source_text[:12000]})
         except ValueError as exc:
             if "public IP" in str(exc) or "http" in str(exc):
                 raise
@@ -382,6 +388,8 @@ STRICT RULES:
 2. You may reorder sections, emphasize matching skills, and refine wording to match the company's domain and tech stack.
 3. Keep valid RenderCV YAML conforming to RenderCV specifications.
 4. The email body must be concise, professional, mention the company name, cite one evidenced company/job fact, include no aggressive pressure, and state that the tailored CV is attached in PDF format.
+5. Use the research to identify the company's services, hiring signals, priorities, terminology, and likely skills; reflect those in the headline, profile emphasis, skills ordering, and email.
+6. Return a genuinely tailored CV, not a byte-for-byte copy of the original. Never invent a requirement when the research does not support it.
 
 Company: {company_name}
 {f'Target Role: {target_role}' if target_role else ''}

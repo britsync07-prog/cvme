@@ -725,6 +725,18 @@ textarea {
 }
 
 /* Campaign Page */
+main.main-content {
+  min-width: 0;
+}
+
+main.main-content .pdf-viewer {
+  height: min(360px, 52vh);
+}
+
+main.main-content .panel {
+  min-width: 0;
+}
+
 .campaign-header {
   display: flex;
   justify-content: space-between;

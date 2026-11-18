@@ -106,7 +106,7 @@
         </details>
 
         {% if campaign.research %}
-        <details class="accordion-box" open>
+        <details class="accordion-box">
           <summary>Company research insights ({{ campaign.research.sources|length }} sources)</summary>
           <div class="research-body">
             {% for s in campaign.research.sources %}

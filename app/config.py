@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     google_redirect_uri: str = ""
     turnstile_secret_key: str = ""
     turnstile_site_key: str = ""
+    sentry_dsn: str = ""
 
 
 settings = Settings()

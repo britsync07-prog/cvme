@@ -8,6 +8,8 @@ import hashlib
 import hmac
 import redis
 import pyotp
+import logging
+import sentry_sdk
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,7 +27,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Notification, PasswordResetToken, Plan, Subscription, SupportTicket, Suppression, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, PasswordResetToken, Plan, Subscription, SupportTicket, Suppression, User, Workspace, WorkspaceMembership
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
@@ -45,6 +47,9 @@ from .services import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if settings.sentry_dsn:
+        sentry_sdk.init(dsn=settings.sentry_dsn, traces_sample_rate=0.1)
     Path("data").mkdir(exist_ok=True)
     settings.artifact_dir.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
@@ -124,10 +129,10 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 class CSRFMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/healthz", "/billing/webhook", "/unsubscribe"}:
-            body = await request.body()
-            token = request.session.get("csrf_token")
             if settings.environment != "production":
                 return await call_next(request)
+            body = await request.body()
+            token = request.session.get("csrf_token")
             supplied = re.search(rb"(?:^|&)csrf_token=([^&]+)", body) or re.search(rb'name="csrf_token"\r?\n\r?\n([^\r\n]+)', body)
             if not token or not supplied or not secrets.compare_digest(supplied.group(1).decode("utf-8", "ignore"), token):
                 return JSONResponse({"detail": "CSRF validation failed."}, status_code=403)
@@ -154,8 +159,12 @@ def healthz():
     try:
         with SessionLocal() as db:
             db.execute(text("SELECT 1"))
+        if settings.environment == "production":
+            redis.Redis.from_url(settings.redis_url).ping()
     except SQLAlchemyError as exc:
         raise HTTPException(503, "Database unavailable") from exc
+    except redis.RedisError as exc:
+        raise HTTPException(503, "Queue unavailable") from exc
     return {"status": "ok"}
 
 
@@ -530,6 +539,11 @@ async def billing_webhook(request: Request):
     provided = parts.get("v1")
     if not timestamp or not provided:
         raise HTTPException(400, "Invalid Stripe signature.")
+    try:
+        if abs(int(timestamp) - int(datetime.now(timezone.utc).timestamp())) > 300:
+            raise HTTPException(400, "Expired Stripe signature.")
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid Stripe signature.") from exc
     signed = f"{timestamp}.{body.decode('utf-8')}".encode("utf-8")
     expected = hmac.new(settings.stripe_webhook_secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, provided):
@@ -546,12 +560,17 @@ async def billing_webhook(request: Request):
         db.add(BillingEvent(provider_event_id=event_id, event_type=event_type, payload=event))
         data = event.get("data", {}).get("object", {})
         workspace_id = data.get("metadata", {}).get("workspace_id")
-        subscription = db.scalar(select(Subscription).where(Subscription.workspace_id == int(workspace_id))) if workspace_id else None
+        provider_subscription_id = data.get("subscription") if event_type.startswith("invoice.") else data.get("id")
+        subscription = db.scalar(select(Subscription).where(Subscription.workspace_id == int(workspace_id))) if workspace_id and str(workspace_id).isdigit() else None
+        if not subscription and provider_subscription_id:
+            subscription = db.scalar(select(Subscription).where(Subscription.provider_subscription_id == provider_subscription_id))
         if subscription:
             if event_type in {"customer.subscription.created", "customer.subscription.updated"}:
                 subscription.status = data.get("status", subscription.status)
                 subscription.provider_customer_id = data.get("customer") or subscription.provider_customer_id
                 subscription.provider_subscription_id = data.get("id") or subscription.provider_subscription_id
+                if data.get("current_period_end"):
+                    subscription.current_period_end = datetime.fromtimestamp(data["current_period_end"], timezone.utc)
             elif event_type == "customer.subscription.deleted":
                 subscription.status = "canceled"
             elif event_type == "invoice.payment_failed":
@@ -559,6 +578,8 @@ async def billing_webhook(request: Request):
                 subscription.grace_ends_at = utc_now() + timedelta(days=7)
             elif event_type == "invoice.paid":
                 subscription.status = "active"
+            if event_type.startswith("invoice.") and subscription:
+                db.merge(Invoice(workspace_id=subscription.workspace_id, provider_invoice_id=data.get("id"), status=data.get("status", event_type.removeprefix("invoice.")), amount_cents=int(data.get("amount_paid") or data.get("amount_due") or 0), currency=data.get("currency", "gbp")))
         db.commit()
     return {"ok": True}
 

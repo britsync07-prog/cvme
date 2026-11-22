@@ -1561,6 +1561,7 @@ def save_settings(
         workspace.outreach_candidate_id = max(outreach_candidate_id, 0) or None
         workspace.outreach_query = outreach_query.strip()
         workspace.outreach_target_role = outreach_target_role.strip()
+        is_admin = user.role in {"admin", "superadmin"}
         if api_key.strip():
             config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
             if not config:
@@ -1573,18 +1574,18 @@ def save_settings(
             db.commit()
         db.commit()
     update_settings(
-        base_url=(base_url.strip() or settings.base_url) if user.role in {"admin", "superadmin"} else settings.base_url,
-        api_key=(api_key.strip() or settings.api_key) if user.role in {"admin", "superadmin"} else settings.api_key,
-        llm_model=(llm_model.strip() or settings.llm_model) if user.role in {"admin", "superadmin"} else settings.llm_model,
-        smtp_host=(smtp_host.strip() or settings.smtp_host) if user.role in {"admin", "superadmin"} else settings.smtp_host,
-        smtp_port=smtp_port if user.role in {"admin", "superadmin"} else settings.smtp_port,
-        smtp_username=(smtp_username.strip() or settings.smtp_username) if user.role in {"admin", "superadmin"} else settings.smtp_username,
-        smtp_password=(smtp_password.strip() or settings.smtp_password) if user.role in {"admin", "superadmin"} else settings.smtp_password,
-        smtp_from=(smtp_from.strip() or settings.smtp_from) if user.role in {"admin", "superadmin"} else settings.smtp_from,
-        smtp_use_tls=smtp_use_tls if user.role in {"admin", "superadmin"} else settings.smtp_use_tls,
-        resend_api_key=(resend_api_key.strip() or settings.resend_api_key) if user.role in {"admin", "superadmin"} else settings.resend_api_key,
-        resend_from=(resend_from.strip() or settings.resend_from) if user.role in {"admin", "superadmin"} else settings.resend_from,
-        companies_house_api_key=(companies_house_api_key.strip() or settings.companies_house_api_key) if user.role in {"admin", "superadmin"} else settings.companies_house_api_key,
+        base_url=(base_url.strip() or settings.base_url) if is_admin else settings.base_url,
+        api_key=(api_key.strip() or settings.api_key) if is_admin else settings.api_key,
+        llm_model=(llm_model.strip() or settings.llm_model) if is_admin else settings.llm_model,
+        smtp_host=(smtp_host.strip() or settings.smtp_host) if is_admin else settings.smtp_host,
+        smtp_port=smtp_port if is_admin else settings.smtp_port,
+        smtp_username=(smtp_username.strip() or settings.smtp_username) if is_admin else settings.smtp_username,
+        smtp_password=(smtp_password.strip() or settings.smtp_password) if is_admin else settings.smtp_password,
+        smtp_from=(smtp_from.strip() or settings.smtp_from) if is_admin else settings.smtp_from,
+        smtp_use_tls=smtp_use_tls if is_admin else settings.smtp_use_tls,
+        resend_api_key=(resend_api_key.strip() or settings.resend_api_key) if is_admin else settings.resend_api_key,
+        resend_from=(resend_from.strip() or settings.resend_from) if is_admin else settings.resend_from,
+        companies_house_api_key=(companies_house_api_key.strip() or settings.companies_house_api_key) if is_admin else settings.companies_house_api_key,
         scrapollo_binary=scrapollo_binary.strip() or "scrapollo",
         scrapollo_cookie_file=scrapollo_cookie_file.strip() or settings.scrapollo_cookie_file,
         scrapollo_input_file=scrapollo_input_file.strip() or settings.scrapollo_input_file,

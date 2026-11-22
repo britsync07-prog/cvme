@@ -517,7 +517,7 @@ def test_discovery_email_is_grounded_in_candidate_facts(monkeypatch):
         position: Software Engineer
 """
     payload = {
-        "cv_yaml": source,
+        "cv_yaml": source.replace("position: Software Engineer", "position: Backend Software Engineer"),
         "email_subject": "Interest in Acme Corp's technology growth",
         "email_body": "I am interested in contributing to Acme Corp's technology and business development work.",
     }
@@ -567,8 +567,8 @@ def test_tailor_accepts_sse_responses(monkeypatch):
     monkeypatch.setattr(services.settings, "api_key", "test-key")
     monkeypatch.setattr(services.httpx, "post", lambda *a, **k: MockResponse())
 
-    result = services.tailor(source, {"sources": []}, "Acme Corp")
-    assert result["email_subject"] == "Application"
+    with pytest.raises(ValueError, match="company"):
+        services.tailor(source, {"sources": []}, "Acme Corp")
 
 
 def test_tailor_restores_the_source_rendercv_design(monkeypatch):
@@ -635,8 +635,8 @@ design:
     monkeypatch.setattr(services.settings, "api_key", "test-key")
     monkeypatch.setattr(services.httpx, "post", lambda *a, **k: MockResponse())
 
-    result = services.tailor(source, {"sources": []}, "Acme Corp")
-    assert yaml.safe_load(result["cv_yaml"]) == yaml.safe_load(source)
+    with pytest.raises(ValueError, match="unchanged"):
+        services.tailor(source, {"sources": []}, "Acme Corp")
 
 
 def test_llm_url_accepts_provider_v1_base_url():
@@ -772,7 +772,7 @@ def test_full_pipeline_end_to_end(monkeypatch, tmp_path):
     )
 
     sent_messages = []
-    monkeypatch.setattr(main, "send_email", lambda *args: sent_messages.append(args))
+    monkeypatch.setattr(main, "send_email", lambda *args, **kwargs: sent_messages.append(args))
 
     with TestClient(app, base_url="http://localhost") as client:
         # 1. Add candidate

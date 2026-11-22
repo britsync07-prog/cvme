@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import base64
+import binascii
 import json
 import re
 import secrets
@@ -601,7 +603,21 @@ async def resend_webhook(request: Request):
     if settings.resend_webhook_secret:
         supplied = request.headers.get("x-tailormail-signature", "")
         expected = hmac.new(settings.resend_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
-        if not supplied or not hmac.compare_digest(supplied, expected):
+        valid = bool(supplied and hmac.compare_digest(supplied, expected))
+        svix_id = request.headers.get("svix-id", "")
+        svix_timestamp = request.headers.get("svix-timestamp", "")
+        svix_signature = request.headers.get("svix-signature", "")
+        try:
+            timestamp = int(svix_timestamp)
+            age = abs(datetime.now(timezone.utc).timestamp() - timestamp)
+            secret = settings.resend_webhook_secret.removeprefix("whsec_")
+            decoded_secret = base64.b64decode(secret + "=" * (-len(secret) % 4))
+            signed = f"{svix_id}.{svix_timestamp}.".encode() + body
+            svix_expected = base64.b64encode(hmac.new(decoded_secret, signed, hashlib.sha256).digest()).decode()
+            valid = valid or (age <= 300 and any(hmac.compare_digest(item.removeprefix("v1,"), svix_expected) for item in svix_signature.split()))
+        except (ValueError, binascii.Error):
+            pass
+        if not valid:
             raise HTTPException(401, "Invalid webhook signature.")
     try:
         payload = json.loads(body.decode("utf-8"))

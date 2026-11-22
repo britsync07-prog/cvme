@@ -494,7 +494,9 @@ def export_account(request: Request):
         workspace, user = current_workspace(request, db)
         candidates = db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace))).all()
         campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace))).all()
-    return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns]})
+        jobs = db.scalars(select(OutreachJob).where(OutreachJob.workspace_id == workspace.id)).all()
+        invoices = db.scalars(select(Invoice).where(Invoice.workspace_id == workspace.id)).all()
+    return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns], "jobs": [{"id": item.id, "type": item.job_type, "status": item.status, "created_at": item.created_at.isoformat()} for item in jobs], "invoices": [{"id": item.id, "status": item.status, "amount_cents": item.amount_cents, "currency": item.currency} for item in invoices]})
 
 
 @app.post("/account/password")
@@ -636,15 +638,30 @@ def billing_portal(request: Request):
 def delete_account(request: Request):
     with SessionLocal() as db:
         workspace, user = current_workspace(request, db)
-        workspace.deleted_at = utc_now()
-        user.is_active = False
-        db.execute(update(Candidate).where(workspace_filter(Candidate, workspace)).values(deleted_at=utc_now()))
-        db.execute(update(Campaign).where(workspace_filter(Campaign, workspace)).values(deleted_at=utc_now()))
-        for model in (EmailAccount, AIProviderConfig, Notification, SupportTicket, Subscription):
+        for campaign in db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace))).all():
+            if campaign.artifact_path:
+                try:
+                    Path(campaign.artifact_path).unlink(missing_ok=True)
+                except OSError:
+                    logging.getLogger("tailormail").warning("Could not remove campaign artifact during deletion", exc_info=True)
+            db.delete(campaign)
+        for candidate in db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace))).all():
+            db.delete(candidate)
+        for model in (EmailAccount, AIProviderConfig, Notification, SupportTicket, Subscription, Invoice, UsageRecord, OutreachJob, AuditEvent, AuditLog):
             for item in db.scalars(select(model).where(model.workspace_id == workspace.id)).all():
                 db.delete(item)
         for item in db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id)).all():
             db.delete(item)
+        for membership in db.scalars(select(WorkspaceMembership).where(WorkspaceMembership.workspace_id == workspace.id)).all():
+            db.delete(membership)
+        for token_model in (SessionToken, PasswordResetToken, EmailVerificationToken):
+            for token in db.scalars(select(token_model).where(token_model.user_id == user.id)).all():
+                db.delete(token)
+        db.delete(workspace)
+        user.is_active = False
+        user.email = f"deleted-{user.id}@invalid.local"
+        user.password_hash = None
+        user.google_sub = None
         db.commit()
     request.session.clear()
     return RedirectResponse("/login", status_code=303)

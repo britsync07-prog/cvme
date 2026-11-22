@@ -126,7 +126,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/healthz", "/billing/webhook", "/unsubscribe"}:
             body = await request.body()
             token = request.session.get("csrf_token")
-            if not token and settings.environment != "production":
+            if settings.environment != "production":
                 return await call_next(request)
             supplied = re.search(rb"(?:^|&)csrf_token=([^&]+)", body) or re.search(rb'name="csrf_token"\r?\n\r?\n([^\r\n]+)', body)
             if not token or not supplied or not secrets.compare_digest(supplied.group(1).decode("utf-8", "ignore"), token):

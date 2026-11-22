@@ -63,13 +63,16 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
             candidate = db.scalar(
                 select(Candidate).where(
                     Candidate.id == configured_candidate,
-                    Candidate.workspace_id == workspace.id,
+                    (Candidate.workspace_id == workspace.id) | Candidate.workspace_id.is_(None),
                     Candidate.deleted_at.is_(None),
                 )
             )
             if not candidate:
                 errors.append("Configured outreach candidate was not found.")
             else:
+                if candidate.workspace_id is None:
+                    candidate.workspace_id = workspace.id
+                    db.commit()
                 readiness_error = cv_outreach_readiness_error(candidate.cv_yaml)
                 if readiness_error:
                     errors.append(readiness_error)

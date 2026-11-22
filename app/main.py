@@ -169,8 +169,7 @@ def pricing_page(request: Request):
         return templates.TemplateResponse(request, "pricing.html", {"plans": plans})
 
 
-@app.get("/{page_name}")
-def public_information_page(request: Request, page_name: str):
+def _legal_page(request: Request, page_name: str):
     pages = {
         "terms": ("Terms of service", "Use TailorMail responsibly and keep your account credentials secure."),
         "privacy": ("Privacy policy", "Workspace data is isolated and used to operate the features you configure."),
@@ -178,10 +177,33 @@ def public_information_page(request: Request, page_name: str):
         "refunds": ("Refund policy", "Subscription refunds are handled according to the plan and billing terms shown at checkout."),
         "contact": ("Contact", "Contact support through your workspace support channel."),
     }
-    if page_name not in pages:
-        raise HTTPException(404, "Page not found")
     title, body = pages[page_name]
     return templates.TemplateResponse(request, "legal.html", {"title": title, "body": body})
+
+
+@app.get("/terms")
+def terms_page(request: Request):
+    return _legal_page(request, "terms")
+
+
+@app.get("/privacy")
+def privacy_page(request: Request):
+    return _legal_page(request, "privacy")
+
+
+@app.get("/acceptable-use")
+def acceptable_use_page(request: Request):
+    return _legal_page(request, "acceptable-use")
+
+
+@app.get("/refunds")
+def refunds_page(request: Request):
+    return _legal_page(request, "refunds")
+
+
+@app.get("/contact")
+def contact_page(request: Request):
+    return _legal_page(request, "contact")
 
 
 @app.get("/robots.txt", include_in_schema=False)

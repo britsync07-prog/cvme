@@ -295,7 +295,7 @@ def contact_page(request: Request):
 
 @app.get("/robots.txt", include_in_schema=False)
 def robots():
-    return PlainTextResponse("User-agent: *\nAllow: /landing\nAllow: /pricing\nDisallow: /\n")
+    return PlainTextResponse("User-agent: *\nDisallow: /\nAllow: /landing\nAllow: /pricing\nAllow: /terms\nAllow: /privacy\nAllow: /acceptable-use\nAllow: /refunds\nAllow: /contact\n")
 
 
 @app.get("/sitemap.xml", include_in_schema=False)
@@ -590,7 +590,8 @@ def billing_page(request: Request, success: int = 0):
         workspace, user = current_workspace(request, db)
         subscription = status_for(db, workspace)
         plans = db.scalars(select(Plan).where(Plan.active.is_(True)).order_by(Plan.id)).all()
-    return templates.TemplateResponse(request, "billing.html", {"status": subscription, "plans": plans, "success": bool(success)})
+        invoices = db.scalars(select(Invoice).where(Invoice.workspace_id == workspace.id).order_by(Invoice.created_at.desc())).all()
+    return templates.TemplateResponse(request, "billing.html", {"status": subscription, "plans": plans, "invoices": invoices, "success": bool(success)})
 
 
 @app.post("/billing/checkout")
@@ -745,6 +746,12 @@ def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
         filters.append(Campaign.workspace_id == workspace_id)
     sent_today = db.scalar(select(func.count(Campaign.id)).where(*filters)) or 0
     daily_limit = workspace.daily_limit if workspace else settings.outreach_daily_limit
+    if workspace:
+        plan_limit = int(status_for(db, workspace)["limits"].get("daily_emails", daily_limit))
+        daily_limit = min(daily_limit, plan_limit)
+        age_days = max((utc_now() - workspace.created_at).days, 0)
+        if age_days < 7:
+            daily_limit = min(daily_limit, max(5, (age_days + 1) * 5))
     return max(daily_limit - sent_today, 0)
 
 
@@ -761,6 +768,7 @@ def dashboard(request: Request, tab: str = "applications"):
             daily_remaining = 0
         subscription_status = status_for(db, workspace)
         notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(20)).all()
+        blocklist = db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id, Suppression.reason == "workspace_blocklist").order_by(Suppression.created_at.desc())).all()
         email_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
         ai_config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
         return templates.TemplateResponse(
@@ -780,6 +788,7 @@ def dashboard(request: Request, tab: str = "applications"):
                 "impersonating": bool(request.session.get("impersonator_id")),
                 "email_account": email_account,
                 "ai_config": ai_config,
+                "blocklist": blocklist,
             },
         )
 
@@ -875,6 +884,14 @@ def admin_metrics(request: Request):
         return JSONResponse({"users": db.scalar(select(func.count(User.id))) or 0, "workspaces": db.scalar(select(func.count(Workspace.id)).where(Workspace.deleted_at.is_(None))) or 0, "active_subscriptions": sum(1 for item in subscriptions if item.status == "active"), "trialing": sum(1 for item in subscriptions if item.status == "trialing"), "sent": status_counts.get("sent", 0), "failed": status_counts.get("failed", 0) + status_counts.get("send_uncertain", 0), "campaign_status": status_counts})
 
 
+@app.get("/admin/email-log")
+def admin_email_log(request: Request, limit: int = 100):
+    with SessionLocal() as db:
+        _require_admin(request, db)
+        campaigns = db.scalars(select(Campaign).where(Campaign.status.in_(["sent", "send_uncertain"])).order_by(Campaign.sent_at.desc(), Campaign.created_at.desc()).limit(min(max(limit, 1), 1000))).all()
+        return JSONResponse({"emails": [{"id": c.id, "workspace_id": c.workspace_id, "company": c.company_name, "recipient": c.recipient_email, "subject": c.email_subject, "status": c.status, "sent_at": c.sent_at.isoformat() if c.sent_at else None} for c in campaigns]})
+
+
 @app.post("/admin/users/{user_id}/status")
 def admin_user_status(request: Request, user_id: int, active: bool = Form()):
     with SessionLocal() as db:
@@ -960,6 +977,18 @@ def admin_support(request: Request):
         return JSONResponse({"tickets": [{"id": t.id, "workspace_id": t.workspace_id, "user_id": t.user_id, "subject": t.subject, "body": t.body, "status": t.status, "created_at": t.created_at.isoformat()} for t in tickets]})
 
 
+@app.post("/admin/suppression")
+def admin_add_suppression(request: Request, email: str = Form(""), domain: str = Form(""), reason: str = Form("admin")):
+    if not email.strip() and not domain.strip():
+        raise HTTPException(400, "Email or domain is required.")
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        db.add(Suppression(workspace_id=None, email=email.strip().lower() or None, domain=domain.strip().lower() or None, reason=reason.strip()[:80] or "admin"))
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="global_suppression_added", entity_type="suppression", detail={"email": bool(email.strip()), "domain": bool(domain.strip())}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/workspaces/{workspace_id}/pause")
 def admin_pause_workspace(request: Request, workspace_id: int, paused: bool = Form()):
     with SessionLocal() as db:
@@ -969,6 +998,22 @@ def admin_pause_workspace(request: Request, workspace_id: int, paused: bool = Fo
             raise HTTPException(404, "Workspace not found.")
         workspace.paused = paused
         db.add(AuditLog(workspace_id=workspace.id, user_id=actor.id, action="workspace_pause_changed", entity_type="workspace", entity_id=workspace.id, detail={"paused": paused}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/workspaces/{workspace_id}/trial")
+def admin_extend_trial(request: Request, workspace_id: int, days: int = Form()):
+    if not -365 <= days <= 365:
+        raise HTTPException(400, "Trial adjustment must be between -365 and 365 days.")
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        subscription = db.scalar(select(Subscription).where(Subscription.workspace_id == workspace_id).order_by(Subscription.id.desc()))
+        if not subscription:
+            raise HTTPException(404, "Subscription not found.")
+        subscription.trial_ends_at = (subscription.trial_ends_at or utc_now()) + timedelta(days=days)
+        subscription.status = "trialing"
+        db.add(AuditLog(workspace_id=workspace_id, user_id=actor.id, action="trial_adjusted", entity_type="workspace", entity_id=workspace_id, detail={"days": days}, ip_address=request.client.host if request.client else None))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 
@@ -991,6 +1036,16 @@ def admin_update_plan(request: Request, plan_id: int, limits_json: str = Form(),
         plan.yearly_price_cents = max(yearly_price_cents, 0)
         plan.active = active
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="plan_updated", entity_type="plan", entity_id=plan.id, detail={"slug": plan.slug}))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/system/kill-switch")
+def admin_kill_switch(request: Request, enabled: bool = Form()):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        update_settings(outreach_kill_switch=enabled)
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="kill_switch_changed", entity_type="system", detail={"enabled": enabled}, ip_address=request.client.host if request.client else None))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 
@@ -1296,6 +1351,8 @@ def preview_pdf(request: Request, campaign_id: int):
 def send_campaign(campaign_id: int, approved: bool = Form(False), request: Request = None, workspace_id: int | None = None):
     if not approved:
         raise HTTPException(400, "Explicit approval is required to send.")
+    if settings.outreach_kill_switch:
+        raise HTTPException(503, "Outreach sending is temporarily paused by the administrator.")
     with SessionLocal() as db:
         if request:
             workspace, user = current_workspace(request, db)
@@ -1323,6 +1380,7 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
             raise HTTPException(400, "Only a ready campaign can be sent.")
         db.commit()
         campaign = require_owned(db, Campaign, campaign_id, workspace)
+        sender_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
         readiness_error = cv_outreach_readiness_error(campaign.candidate.cv_yaml)
         if readiness_error or not campaign.research or not campaign.research.get("sources"):
             readiness_error = readiness_error or "Company research and a public source are required before sending."
@@ -1336,7 +1394,7 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
                 campaign.email_subject,
                 campaign.email_body.rstrip() + "\n\nIf you prefer not to receive application emails, reply with 'unsubscribe'.",
                 Path(campaign.artifact_path),
-                email_account=db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id)),
+                email_account=sender_account,
             )
             campaign.status = "sent"
             campaign.sent_at = datetime.now(timezone.utc)
@@ -1348,6 +1406,8 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
             db.commit()
         except Exception as exc:
             campaign.status = "send_uncertain"
+            if sender_account and ("401" in str(exc) or "403" in str(exc) or "authentication" in str(exc).lower() or "login" in str(exc).lower()):
+                sender_account.status = "reauth_required" if sender_account.provider == "gmail" else "paused"
             audit(db, campaign, "send_uncertain", str(exc))
             db.add(Notification(workspace_id=workspace.id, user_id=user.id, kind="send_error", message=f"Delivery failed for {campaign.recipient_email}."))
             db.commit()
@@ -1508,6 +1568,29 @@ def save_email_account(
             account.provider = "smtp"
             account.encrypted_credentials = encrypt_secret(payload)
             account.status = "active"
+        db.commit()
+    return RedirectResponse("/?tab=settings", status_code=303)
+
+
+@app.post("/settings/email-account/disconnect")
+def disconnect_email_account(request: Request):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status != "disconnected").order_by(EmailAccount.id))
+        if account:
+            account.status = "disconnected"
+            db.commit()
+    return RedirectResponse("/?tab=settings", status_code=303)
+
+
+@app.post("/settings/blocklist")
+def add_workspace_blocklist(request: Request, domain: str = Form()):
+    normalized = domain.strip().lower().lstrip("@")
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", normalized):
+        raise HTTPException(400, "Enter a valid company domain.")
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        db.add(Suppression(workspace_id=workspace.id, domain=normalized, reason="workspace_blocklist"))
         db.commit()
     return RedirectResponse("/?tab=settings", status_code=303)
 

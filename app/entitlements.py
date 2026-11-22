@@ -52,6 +52,10 @@ def require_candidate_slot(db, workspace: Workspace, additional: int = 1) -> Non
 def require_send_slot(db, workspace: Workspace) -> None:
     status = require_feature(db, workspace, "daily_emails")
     limit = int(status["limits"].get("daily_emails", settings.outreach_daily_limit))
+    limit = min(limit, max(int(workspace.daily_limit or limit), 1))
+    age_days = max((_now() - workspace.created_at).days, 0)
+    if age_days < 7:
+        limit = min(limit, max(5, (age_days + 1) * 5))
     local = datetime.now(ZoneInfo(workspace.timezone))
     start = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     count = db.scalar(select(func.count(Campaign.id)).where(Campaign.workspace_id == workspace.id, Campaign.status == "sent", Campaign.sent_at >= start)) or 0

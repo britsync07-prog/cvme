@@ -1,6 +1,8 @@
 """Run one configured daily outreach batch; invoke this from the server scheduler."""
 
 import json
+import random
+import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 
@@ -80,6 +82,8 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
 
 
 def main(workspace_id: int | None = None) -> None:
+    if settings.outreach_kill_switch:
+        raise SystemExit("Outreach kill switch is enabled.")
     errors = production_preflight_errors(workspace_id)
     if errors:
         raise SystemExit("\n".join(errors))
@@ -124,6 +128,8 @@ def main(workspace_id: int | None = None) -> None:
         if result["completed"] == 0:
             # A failed AI/render/send attempt must not prevent trying the next lead.
             continue
+        if auto_send and settings.environment == "production" and result.get("sent", 0):
+            time.sleep(random.uniform(max(settings.outreach_min_delay_seconds, 0), max(settings.outreach_max_delay_seconds, settings.outreach_min_delay_seconds)))
 
 
 if __name__ == "__main__":

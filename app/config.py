@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     outreach_target_role: str = ""
     outreach_auto_send: bool = False
     outreach_timezone: str = "Asia/Dhaka"
+    outreach_min_delay_seconds: int = 5
+    outreach_max_delay_seconds: int = 15
+    outreach_kill_switch: bool = False
     trial_days: int = 15
     trial_card_required: bool = False
     stripe_secret_key: str = ""

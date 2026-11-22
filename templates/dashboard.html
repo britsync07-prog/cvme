@@ -443,7 +443,7 @@
             </div>
           </div>
           <div id="smtp-test-result" class="test-feedback"></div>
-          <div class="panel-header"><div><h3>Workspace sender</h3><p class="subtitle">{{ email_account.email if email_account else 'No tenant sender connected' }}. Connect Gmail or save encrypted SMTP credentials below.</p></div><a class="button-link" href="/settings/gmail/connect">Connect Gmail</a></div>
+          <div class="panel-header"><div><h3>Workspace sender</h3><p class="subtitle">{{ email_account.email if email_account else 'No tenant sender connected' }}. Connect Gmail or save encrypted SMTP credentials below.</p></div><div><a class="button-link" href="/settings/gmail/connect">Connect Gmail</a>{% if email_account %}<form method="post" action="/settings/email-account/disconnect" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small danger" type="submit">Disconnect</button></form>{% endif %}</div></div>
           <form action="/settings/email-account" method="post" class="standard-form"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><div class="form-row"><label class="field"><span>SMTP from email</span><input name="email" type="email" placeholder="you@company.com" required></label><label class="field"><span>SMTP host</span><input name="host" placeholder="smtp.example.com" required></label></div><div class="form-row"><label class="field"><span>Port</span><input name="port" type="number" value="587"></label><label class="field"><span>Username</span><input name="username"></label></div><div class="form-row"><label class="field"><span>Password</span><input name="password" type="password"></label><label class="checkbox-label"><input name="use_tls" type="checkbox" value="true" checked><span>Use TLS</span></label></div><button class="button secondary" type="submit">Save encrypted SMTP account</button></form>
         </div>
 
@@ -487,11 +487,23 @@
           <input type="hidden" name="outreach_policy" value="review_required">
         </div>
 
+        <div class="settings-section">
+          <h3>Workspace blocklist</h3>
+          <p class="subtitle">Blocked domains are skipped for this workspace before research, tailoring, or delivery.</p>
+          <form action="/settings/blocklist" method="post" class="form-row">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+            <label class="field"><span>Company domain</span><input name="domain" type="text" placeholder="example.co.uk" required></label>
+            <div class="field"><span>&nbsp;</span><button class="button secondary" type="submit">Add to blocklist</button></div>
+          </form>
+          {% if blocklist %}<div class="tag-list">{% for item in blocklist %}<span class="tag">{{ item.domain }}</span>{% endfor %}</div>{% else %}<p class="muted">No workspace domains blocked.</p>{% endif %}
+        </div>
+
         <div class="form-actions">
           <button type="submit" class="button primary">Save Settings</button>
         </div>
       </form>
       <div class="settings-section"><h3>Account security</h3><div class="form-row"><form action="/account/password" method="post" class="standard-form"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><label class="field"><span>Current password</span><input name="current_password" type="password" required></label><label class="field"><span>New password</span><input name="new_password" type="password" minlength="12" required></label><button class="button secondary" type="submit">Change password</button></form><form action="/account/email" method="post" class="standard-form"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><label class="field"><span>New email</span><input name="email" type="email" required></label><button class="button secondary" type="submit">Change email</button></form></div></div>
+      <div class="settings-section"><h3>Two-factor authentication</h3><p class="subtitle">Add an authenticator-app code to protect sign-in.</p><button class="button secondary" type="button" onclick="setup2FA()">Set up authenticator</button><form id="twofa-form" action="/settings/2fa/enable" method="post" style="display:none"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><input name="code" inputmode="numeric" pattern="[0-9]{6}" placeholder="6-digit code" required><button class="button primary" type="submit">Enable 2FA</button></form></div>
     </div>
     {% endif %}
   </main>
@@ -550,6 +562,13 @@ async function testSMTP() {
     el.className = 'test-feedback error';
     el.innerText = '✗ Network request failed: ' + err.message;
   }
+}
+async function setup2FA() {
+  const response = await fetch('/settings/2fa/setup');
+  const data = await response.json();
+  if (!response.ok) { alert(data.detail || '2FA setup failed'); return; }
+  alert('Add this URI to your authenticator app:\n' + data.otpauth_uri);
+  document.getElementById('twofa-form').style.display = 'flex';
 }
 </script>
 </body>

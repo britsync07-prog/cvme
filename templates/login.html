@@ -18,8 +18,10 @@
       <input type="hidden" name="next" value="{{ next }}">
       <label>Username<input name="username" autocomplete="username" required autofocus></label>
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      {% if mfa %}<label>Authenticator code<input name="otp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required autofocus></label>{% endif %}
       <button type="submit">Sign in</button>
     </form>
+    <a class="button secondary" href="/auth/google">Continue with Google</a>
     <p class="login-copy"><a href="/forgot-password">Forgot password?</a></p>
     <p class="login-copy">New to TailorMail? <a href="/signup">Create a workspace</a></p>
   </main>

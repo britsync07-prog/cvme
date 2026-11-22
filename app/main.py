@@ -7,6 +7,7 @@ import secrets
 import hashlib
 import hmac
 import redis
+import pyotp
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,7 +26,7 @@ from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_send_slot, status_for
 from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, PasswordResetToken, Plan, Subscription, Suppression, User, Workspace, WorkspaceMembership
-from .security import encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
+from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
     candidates_from_zip,
@@ -76,7 +77,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if (
             settings.admin_username
-            and request.url.path not in {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe"}
+            and request.url.path not in {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe"}
             and not request.url.path.startswith("/static/")
             and not request.session.get("authenticated")
         ):
@@ -146,15 +147,69 @@ def _safe_next(next_path: str) -> str:
 
 
 @app.get("/login")
-def login_page(request: Request, next: str = "/"):
+def login_page(request: Request, next: str = "/", mfa: int = 0):
     if request.session.get("authenticated"):
         return RedirectResponse(_safe_next(next), status_code=303)
-    return templates.TemplateResponse(request, "login.html", {"next": _safe_next(next), "error": ""})
+    return templates.TemplateResponse(request, "login.html", {"next": _safe_next(next), "error": "", "mfa": bool(mfa)})
 
 
 @app.get("/signup")
 def signup_page(request: Request):
     return templates.TemplateResponse(request, "signup.html", {"error": ""})
+
+
+@app.get("/auth/google")
+def google_login(request: Request):
+    if not settings.google_client_id or not settings.google_redirect_uri:
+        return templates.TemplateResponse(request, "auth_message.html", {"title": "Google sign-in unavailable", "message": "Google OAuth is not configured on this deployment."}, status_code=503)
+    state = new_token()
+    request.session["google_oauth_state"] = state
+    params = urlencode({"client_id": settings.google_client_id, "redirect_uri": settings.google_redirect_uri, "response_type": "code", "scope": "openid email profile", "access_type": "offline", "prompt": "select_account", "state": state})
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}", status_code=302)
+
+
+@app.get("/auth/google/callback")
+def google_callback(request: Request, code: str = "", state: str = ""):
+    expected = request.session.pop("google_oauth_state", "")
+    if not code or not expected or not secrets.compare_digest(expected, state):
+        raise HTTPException(400, "Invalid Google sign-in state.")
+    try:
+        token_response = httpx.post("https://oauth2.googleapis.com/token", data={"code": code, "client_id": settings.google_client_id, "client_secret": settings.google_client_secret, "redirect_uri": settings.google_redirect_uri, "grant_type": "authorization_code"}, timeout=30)
+        token_response.raise_for_status()
+        access_token = token_response.json()["access_token"]
+        profile = httpx.get("https://openidconnect.googleapis.com/v1/userinfo", headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+        profile.raise_for_status()
+        details = profile.json()
+        email = str(details.get("email", "")).strip().lower()
+        google_sub = str(details.get("sub", "")).strip()
+        if not email or not google_sub:
+            raise ValueError("Google did not return a verified email.")
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        raise HTTPException(400, f"Google sign-in failed: {exc}") from exc
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.google_sub == google_sub)) or db.scalar(select(User).where(User.email == email))
+        if not user:
+            user = User(email=email, google_sub=google_sub, role="user", email_verified_at=utc_now(), terms_accepted_at=utc_now())
+            db.add(user)
+            db.flush()
+            slug = re.sub(r"[^a-z0-9]+", "-", email.split("@", 1)[0]).strip("-") or "workspace"
+            if db.scalar(select(Workspace).where(Workspace.slug == slug)):
+                slug = f"{slug}-{user.id}"
+            workspace = Workspace(name=f"{email}'s workspace", slug=slug, owner_user_id=user.id)
+            db.add(workspace)
+            db.flush()
+            db.add(WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role="owner"))
+            ensure_default_plans(db)
+            starter = db.scalar(select(Plan).where(Plan.slug == "starter"))
+            db.add(Subscription(workspace_id=workspace.id, plan_id=starter.id, status="trialing", trial_ends_at=utc_now() + timedelta(days=settings.trial_days)))
+        else:
+            user.google_sub = google_sub
+            user.email_verified_at = user.email_verified_at or utc_now()
+            workspace = db.scalar(select(Workspace).join(WorkspaceMembership).where(WorkspaceMembership.user_id == user.id))
+        db.commit()
+        request.session.clear()
+        request.session.update({"authenticated": True, "user_id": user.id, "workspace_id": workspace.id})
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/landing")
@@ -230,6 +285,8 @@ def signup(
     password: str = Form(),
     terms: bool = Form(False),
 ):
+    if not settings.signup_enabled:
+        raise HTTPException(403, "New signups are currently closed.")
     if not terms:
         return templates.TemplateResponse(request, "signup.html", {"error": "You must accept the acceptable-use and privacy terms."}, status_code=400)
     email = email.strip().lower()
@@ -254,14 +311,17 @@ def signup(
         db.add(WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role="owner"))
         ensure_default_plans(db)
         starter = db.scalar(select(Plan).where(Plan.slug == "starter"))
-        db.add(Subscription(workspace_id=workspace.id, plan_id=starter.id, status="trialing", trial_ends_at=utc_now() + timedelta(days=15)))
+        db.add(Subscription(workspace_id=workspace.id, plan_id=starter.id, status="trialing", trial_ends_at=utc_now() + timedelta(days=settings.trial_days)))
         db.commit()
         request.session.clear()
         request.session.update({"authenticated": True, "user_id": user.id, "workspace_id": workspace.id})
         verification = new_token()
         db.add(EmailVerificationToken(user_id=user.id, token_hash=token_hash(verification), expires_at=utc_now() + timedelta(hours=24)))
         db.commit()
-        send_system_email(email, "Verify your TailorMail account", f"Verify your account: {settings.base_url}/verify-email?token={verification}")
+        try:
+            send_system_email(email, "Verify your TailorMail account", f"Verify your account: {settings.base_url}/verify-email?token={verification}")
+        except Exception:
+            pass
     return RedirectResponse("/", status_code=303)
 
 
@@ -304,7 +364,10 @@ def forgot_password(request: Request, email: str = Form()):
             raw = new_token()
             db.add(PasswordResetToken(user_id=user.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=1)))
             db.commit()
-            send_system_email(user.email, "Reset your TailorMail password", f"Reset your password: {settings.base_url}/reset-password?token={raw}")
+            try:
+                send_system_email(user.email, "Reset your TailorMail password", f"Reset your password: {settings.base_url}/reset-password?token={raw}")
+            except Exception:
+                pass
     return templates.TemplateResponse(request, "forgot_password.html", {"message": "If that email exists, a reset link has been sent."})
 
 
@@ -332,9 +395,20 @@ def reset_password(request: Request, token: str = Form(), password: str = Form()
 
 
 @app.post("/login")
-def login(request: Request, username: str = Form(), password: str = Form(), next: str = Form("/")):
+def login(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/"), otp: str = Form("")):
     email = username.strip().lower()
     with SessionLocal() as db:
+        pending_id = request.session.get("pending_mfa_user_id")
+        if pending_id and otp:
+            pending = db.get(User, pending_id)
+            if pending and pending.totp_enabled and pending.totp_secret and pyotp.TOTP(decrypt_secret(pending.totp_secret)).verify(otp.strip(), valid_window=1):
+                membership = db.scalar(select(WorkspaceMembership).where(WorkspaceMembership.user_id == pending.id).order_by(WorkspaceMembership.created_at))
+                if membership:
+                    request.session.pop("pending_mfa_user_id", None)
+                    request.session.clear()
+                    request.session.update({"authenticated": True, "user_id": pending.id, "workspace_id": membership.workspace_id})
+                    return RedirectResponse(_safe_next(next), status_code=303)
+            return templates.TemplateResponse(request, "login.html", {"next": _safe_next(next), "error": "Invalid authenticator code.", "mfa": True}, status_code=401)
         user = db.scalar(select(User).where(User.email == email))
         if user and user.locked_until and user.locked_until <= utc_now():
             user.locked_until = None
@@ -344,6 +418,9 @@ def login(request: Request, username: str = Form(), password: str = Form(), next
             user.last_login_at = utc_now()
             membership = db.scalar(select(WorkspaceMembership).where(WorkspaceMembership.user_id == user.id).order_by(WorkspaceMembership.created_at))
             if membership:
+                if user.totp_enabled:
+                    request.session["pending_mfa_user_id"] = user.id
+                    return RedirectResponse(f"/login?mfa=1&next={quote(_safe_next(next), safe='/?=&')}", status_code=303)
                 db.commit()
                 request.session.clear()
                 request.session.update({"authenticated": True, "user_id": user.id, "workspace_id": membership.workspace_id})
@@ -423,6 +500,52 @@ async def billing_webhook(request: Request):
     return {"ok": True}
 
 
+@app.get("/billing")
+def billing_page(request: Request, success: int = 0):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        subscription = status_for(db, workspace)
+        plans = db.scalars(select(Plan).where(Plan.active.is_(True)).order_by(Plan.id)).all()
+    return templates.TemplateResponse(request, "billing.html", {"status": subscription, "plans": plans, "success": bool(success)})
+
+
+@app.post("/billing/checkout")
+def billing_checkout(request: Request, plan_slug: str = Form(), interval: str = Form("monthly")):
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Stripe billing is not configured.")
+    if interval not in {"monthly", "yearly"}:
+        raise HTTPException(400, "Invalid billing interval.")
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        plan = db.scalar(select(Plan).where(Plan.slug == plan_slug, Plan.active.is_(True)))
+        if not plan:
+            raise HTTPException(404, "Plan not found.")
+        price = plan.stripe_monthly_price_id if interval == "monthly" else plan.stripe_yearly_price_id
+        if not price:
+            raise HTTPException(503, "This plan has no Stripe price configured yet.")
+        data = {"mode": "subscription", "success_url": f"{settings.base_url}/billing?success=1", "cancel_url": f"{settings.base_url}/billing", "line_items[0][price]": price, "line_items[0][quantity]": "1", "customer_email": user.email, "metadata[workspace_id]": str(workspace.id), "subscription_data[metadata][workspace_id]": str(workspace.id)}
+    response = httpx.post("https://api.stripe.com/v1/checkout/sessions", data=data, auth=(settings.stripe_secret_key, ""), timeout=30)
+    if response.status_code >= 400:
+        raise HTTPException(502, "Stripe checkout could not be created.")
+    return RedirectResponse(response.json().get("url", "/billing"), status_code=303)
+
+
+@app.get("/billing/portal")
+def billing_portal(request: Request):
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Stripe billing is not configured.")
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        subscription = db.scalar(select(Subscription).where(Subscription.workspace_id == workspace.id).order_by(Subscription.id.desc()))
+        if not subscription or not subscription.provider_customer_id:
+            raise HTTPException(400, "No Stripe customer is linked to this workspace yet.")
+        data = {"customer": subscription.provider_customer_id, "return_url": f"{settings.base_url}/billing"}
+    response = httpx.post("https://api.stripe.com/v1/billing_portal/sessions", data=data, auth=(settings.stripe_secret_key, ""), timeout=30)
+    if response.status_code >= 400:
+        raise HTTPException(502, "Stripe portal could not be opened.")
+    return RedirectResponse(response.json().get("url", "/billing"), status_code=303)
+
+
 @app.post("/account/delete")
 def delete_account(request: Request):
     with SessionLocal() as db:
@@ -440,6 +563,41 @@ def delete_account(request: Request):
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
+
+
+@app.get("/settings/2fa/setup")
+def setup_2fa(request: Request):
+    with SessionLocal() as db:
+        _, user = current_workspace(request, db)
+        secret = pyotp.random_base32()
+        request.session["pending_totp_secret"] = secret
+        return JSONResponse({"issuer": "TailorMail", "account": user.email, "otpauth_uri": pyotp.TOTP(secret).provisioning_uri(user.email, issuer_name="TailorMail")})
+
+
+@app.post("/settings/2fa/enable")
+def enable_2fa(request: Request, code: str = Form()):
+    secret = request.session.get("pending_totp_secret")
+    if not secret or not pyotp.TOTP(secret).verify(code.strip(), valid_window=1):
+        raise HTTPException(400, "Invalid authenticator code.")
+    with SessionLocal() as db:
+        _, user = current_workspace(request, db)
+        user.totp_secret = encrypt_secret(secret)
+        user.totp_enabled = True
+        db.commit()
+    request.session.pop("pending_totp_secret", None)
+    return RedirectResponse("/?tab=settings", status_code=303)
+
+
+@app.post("/settings/2fa/disable")
+def disable_2fa(request: Request, code: str = Form()):
+    with SessionLocal() as db:
+        _, user = current_workspace(request, db)
+        if not user.totp_enabled or not user.totp_secret or not pyotp.TOTP(decrypt_secret(user.totp_secret)).verify(code.strip(), valid_window=1):
+            raise HTTPException(400, "Invalid authenticator code.")
+        user.totp_enabled = False
+        user.totp_secret = None
+        db.commit()
+    return RedirectResponse("/?tab=settings", status_code=303)
 
 
 @app.post("/jobs/daily-outreach")
@@ -465,8 +623,10 @@ def audit(db, campaign: Campaign, action: str, detail: str, user_id: int | None 
 
 
 def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
+    workspace = db.get(Workspace, workspace_id) if workspace_id is not None else None
+    timezone_name = workspace.timezone if workspace else settings.outreach_timezone
     try:
-        local_timezone = ZoneInfo(settings.outreach_timezone)
+        local_timezone = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as exc:
         raise ValueError("OUTREACH_TIMEZONE must be a valid IANA timezone.") from exc
     now = datetime.now(local_timezone)
@@ -475,7 +635,8 @@ def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
     if workspace_id is not None:
         filters.append(Campaign.workspace_id == workspace_id)
     sent_today = db.scalar(select(func.count(Campaign.id)).where(*filters)) or 0
-    return max(settings.outreach_daily_limit - sent_today, 0)
+    daily_limit = workspace.daily_limit if workspace else settings.outreach_daily_limit
+    return max(daily_limit - sent_today, 0)
 
 
 @app.get("/")
@@ -497,11 +658,12 @@ def dashboard(request: Request, tab: str = "applications"):
                 "campaigns": campaigns,
                 "candidates": candidates,
                 "counts": counts,
-                "daily_sent": settings.outreach_daily_limit - daily_remaining,
+                "daily_sent": (workspace.daily_limit if workspace else settings.outreach_daily_limit) - daily_remaining,
                 "daily_remaining": daily_remaining,
                 "active_tab": tab,
                 "settings": settings,
                 "subscription_status": subscription_status,
+                "workspace": workspace,
             },
         )
 
@@ -523,6 +685,68 @@ def admin_dashboard(request: Request):
                 "audit_count": db.scalar(select(func.count(AuditLog.id))) or 0,
             },
         )
+
+
+def _require_admin(request: Request, db):
+    _, user = current_workspace(request, db)
+    if user.role not in {"admin", "superadmin"}:
+        raise HTTPException(403, "Administrator access required.")
+    return user
+
+
+@app.get("/admin/users")
+def admin_users(request: Request, q: str = ""):
+    with SessionLocal() as db:
+        _require_admin(request, db)
+        query = select(User).order_by(User.created_at.desc())
+        if q.strip():
+            query = query.where(User.email.ilike(f"%{q.strip()}%"))
+        users = db.scalars(query).all()
+        return JSONResponse({"users": [{"id": u.id, "email": u.email, "role": u.role, "active": u.is_active, "verified": bool(u.email_verified_at), "created_at": u.created_at.isoformat()} for u in users]})
+
+
+@app.post("/admin/users/{user_id}/status")
+def admin_user_status(request: Request, user_id: int, active: bool = Form()):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        target = db.get(User, user_id)
+        if not target:
+            raise HTTPException(404, "User not found.")
+        if target.id == actor.id and not active:
+            raise HTTPException(400, "You cannot disable your own account.")
+        target.is_active = active
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="user_status_changed", entity_type="user", entity_id=target.id, detail={"active": active}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/role")
+def admin_user_role(request: Request, user_id: int, role: str = Form()):
+    if role not in {"user", "admin", "superadmin"}:
+        raise HTTPException(400, "Invalid role.")
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        if actor.role != "superadmin" and role == "superadmin":
+            raise HTTPException(403, "Only superadmins can grant superadmin access.")
+        target = db.get(User, user_id)
+        if not target:
+            raise HTTPException(404, "User not found.")
+        target.role = role
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="user_role_changed", entity_type="user", entity_id=target.id, detail={"role": role}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.get("/admin/audit.csv")
+def admin_audit_csv(request: Request):
+    with SessionLocal() as db:
+        _require_admin(request, db)
+        rows = db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(10000)).all()
+    lines = ["id,user_id,action,entity_type,entity_id,created_at,detail"]
+    for row in rows:
+        detail = json.dumps(row.detail or {}, ensure_ascii=False).replace('"', '""')
+        lines.append(f'{row.id},{row.user_id or ""},{row.action},{row.entity_type or ""},{row.entity_id or ""},{row.created_at.isoformat()},"{detail}"')
+    return PlainTextResponse("\n".join(lines), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=audit.csv"})
 
 
 @app.post("/candidates")
@@ -880,9 +1104,19 @@ def save_settings(
     outreach_target_role: str = Form(""),
     outreach_auto_send: bool = Form(False),
     outreach_timezone: str = Form("Asia/Dhaka"),
+    outreach_schedule_time: str = Form("09:00"),
 ):
     with SessionLocal() as db:
         workspace, _ = current_workspace(request, db)
+        try:
+            ZoneInfo(outreach_timezone.strip() or workspace.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise HTTPException(400, "Daily schedule timezone must be a valid IANA timezone.") from exc
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", outreach_schedule_time.strip()):
+            raise HTTPException(400, "Daily schedule time must use HH:MM format.")
+        workspace.timezone = outreach_timezone.strip() or workspace.timezone
+        workspace.schedule_time = outreach_schedule_time.strip()
+        workspace.daily_limit = min(max(outreach_daily_limit, 1), 100)
         if api_key.strip():
             config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
             if not config:
@@ -893,6 +1127,7 @@ def save_settings(
                 config.encrypted_api_key = encrypt_secret(api_key.strip())
                 config.model_name = llm_model.strip() or config.model_name
             db.commit()
+        db.commit()
     update_settings(
         base_url=base_url.strip() or settings.base_url,
         api_key=api_key.strip() or settings.api_key,

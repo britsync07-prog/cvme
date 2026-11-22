@@ -23,6 +23,7 @@
   </header>
 
   <nav class="tab-bar">
+    <a href="/billing" class="tab-item">Billing</a>
     <a href="/?tab=applications" class="tab-item {% if active_tab == 'applications' %}active{% endif %}">
       Applications
       <span class="tab-count">{{ campaigns|length }}</span>
@@ -67,7 +68,7 @@
       </div>
       <div class="metric-card highlight-sent">
         <span class="metric-label">Emails Sent Today</span>
-        <strong class="metric-value">{{ daily_sent }} / {{ settings.outreach_daily_limit }}</strong>
+        <strong class="metric-value">{{ daily_sent }} / {{ workspace.daily_limit }}</strong>
         <span class="metric-subtitle">{{ daily_remaining }} remaining</span>
       </div>
       <div class="metric-card">
@@ -478,6 +479,7 @@
             </label>
           </div>
           <label class="field"><span>Daily schedule timezone</span><input name="outreach_timezone" value="{{ settings.outreach_timezone }}" placeholder="e.g. Asia/Dhaka"></label>
+          <label class="field"><span>Daily schedule time</span><input name="outreach_schedule_time" type="time" value="{{ workspace.schedule_time }}"></label>
           <label class="checkbox-label"><input name="outreach_auto_send" type="checkbox" value="true" {% if settings.outreach_auto_send %}checked{% endif %}><span>Automatically send after a successful preparation.</span></label>
           <input type="hidden" name="outreach_policy" value="review_required">
         </div>
@@ -497,6 +499,7 @@ async function testLLM() {
   el.className = 'test-feedback pending';
   el.innerText = 'Testing connection to ' + document.getElementById('base_url').value + '...';
   const data = new FormData();
+  data.append('csrf_token', document.querySelector('input[name="csrf_token"]').value);
   data.append('base_url', document.getElementById('base_url').value);
   data.append('api_key', document.getElementById('api_key').value);
   data.append('llm_model', document.getElementById('llm_model').value);
@@ -521,6 +524,7 @@ async function testSMTP() {
   el.className = 'test-feedback pending';
   el.innerText = 'Connecting to SMTP host...';
   const data = new FormData();
+  data.append('csrf_token', document.querySelector('input[name="csrf_token"]').value);
   data.append('smtp_host', document.getElementById('smtp_host').value);
   data.append('smtp_port', document.getElementById('smtp_port').value);
   data.append('smtp_username', document.getElementById('smtp_username').value);

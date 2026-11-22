@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     stripe_publishable_key: str = ""
     redis_url: str = "redis://redis:6379/0"
     signup_enabled: bool = True
+    maintenance_mode: bool = False
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = ""

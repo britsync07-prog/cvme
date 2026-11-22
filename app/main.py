@@ -58,6 +58,10 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         backfill_legacy_rows(db)
+        if setting_value(db, "signup_enabled", ""):
+            settings.signup_enabled = setting_value(db, "signup_enabled").lower() == "true"
+        if setting_value(db, "maintenance_mode", ""):
+            settings.maintenance_mode = setting_value(db, "maintenance_mode").lower() == "true"
     yield
 
 
@@ -97,9 +101,12 @@ def rate_limited(request: Request, bucket: str, limit: int, window: int = 900) -
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        public_paths = {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
+        if settings.maintenance_mode and request.url.path not in public_paths and not request.url.path.startswith("/static/") and not request.session.get("authenticated"):
+            return PlainTextResponse("TailorMail is temporarily under maintenance.", status_code=503)
         if (
             settings.admin_username
-            and request.url.path not in {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
+            and request.url.path not in public_paths
             and not request.url.path.startswith("/static/")
             and not request.session.get("authenticated")
         ):
@@ -990,6 +997,23 @@ def admin_users(request: Request, q: str = ""):
         return JSONResponse({"users": [{"id": u.id, "email": u.email, "role": u.role, "active": u.is_active, "verified": bool(u.email_verified_at), "created_at": u.created_at.isoformat()} for u in users]})
 
 
+@app.get("/admin/users/{user_id}")
+def admin_user_detail(request: Request, user_id: int):
+    with SessionLocal() as db:
+        _require_admin(request, db)
+        target = db.get(User, user_id)
+        if not target:
+            raise HTTPException(404, "User not found.")
+        workspaces = db.scalars(select(Workspace).join(WorkspaceMembership).where(WorkspaceMembership.user_id == target.id)).all()
+        workspace_ids = [item.id for item in workspaces]
+        candidates = db.scalars(select(Candidate).where(Candidate.workspace_id.in_(workspace_ids))).all() if workspace_ids else []
+        campaigns = db.scalars(select(Campaign).where(Campaign.workspace_id.in_(workspace_ids)).order_by(Campaign.created_at.desc()).limit(500)).all() if workspace_ids else []
+        usage = db.scalars(select(UsageRecord).where(UsageRecord.workspace_id.in_(workspace_ids)).order_by(UsageRecord.created_at.desc()).limit(500)).all() if workspace_ids else []
+        invoices = db.scalars(select(Invoice).where(Invoice.workspace_id.in_(workspace_ids)).order_by(Invoice.created_at.desc())).all() if workspace_ids else []
+        senders = db.scalars(select(EmailAccount).where(EmailAccount.workspace_id.in_(workspace_ids))).all() if workspace_ids else []
+        return JSONResponse({"user": {"id": target.id, "email": target.email, "role": target.role, "active": target.is_active, "verified": bool(target.email_verified_at), "created_at": target.created_at.isoformat()}, "workspaces": [{"id": item.id, "name": item.name, "paused": item.paused} for item in workspaces], "candidates": [{"id": item.id, "name": item.name} for item in candidates], "campaigns": [{"id": item.id, "company": item.company_name, "recipient": item.recipient_email, "status": item.status} for item in campaigns], "usage": [{"metric": item.metric, "quantity": item.quantity, "created_at": item.created_at.isoformat()} for item in usage], "invoices": [{"id": item.id, "status": item.status, "amount_cents": item.amount_cents} for item in invoices], "senders": [{"email": item.email, "provider": item.provider, "status": item.status} for item in senders]})
+
+
 @app.get("/admin/metrics")
 def admin_metrics(request: Request):
     with SessionLocal() as db:
@@ -1008,6 +1032,31 @@ def admin_email_log(request: Request, limit: int = 100):
         _require_admin(request, db)
         campaigns = db.scalars(select(Campaign).where(Campaign.status.in_(["sent", "send_uncertain"])).order_by(Campaign.sent_at.desc(), Campaign.created_at.desc()).limit(min(max(limit, 1), 1000))).all()
         return JSONResponse({"emails": [{"id": c.id, "workspace_id": c.workspace_id, "company": c.company_name, "recipient": c.recipient_email, "subject": c.email_subject, "status": c.status, "sent_at": c.sent_at.isoformat() if c.sent_at else None} for c in campaigns]})
+
+
+@app.get("/admin/campaigns")
+def admin_campaigns(request: Request, status: str = "", limit: int = 500):
+    with SessionLocal() as db:
+        _require_admin(request, db)
+        query = select(Campaign).order_by(Campaign.created_at.desc()).limit(min(max(limit, 1), 2000))
+        if status:
+            query = query.where(Campaign.status == status)
+        campaigns = db.scalars(query).all()
+        return JSONResponse({"campaigns": [{"id": item.id, "workspace_id": item.workspace_id, "company": item.company_name, "recipient": item.recipient_email, "status": item.status, "created_at": item.created_at.isoformat(), "sent_at": item.sent_at.isoformat() if item.sent_at else None} for item in campaigns]})
+
+
+@app.post("/admin/campaigns/{campaign_id}/pause")
+def admin_pause_campaign(request: Request, campaign_id: int):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        campaign = db.get(Campaign, campaign_id)
+        if not campaign:
+            raise HTTPException(404, "Campaign not found.")
+        if campaign.status not in {"sent", "deleted"}:
+            campaign.status = "paused"
+            db.add(AuditLog(workspace_id=campaign.workspace_id, user_id=actor.id, action="campaign_paused_by_admin", entity_type="campaign", entity_id=campaign.id, detail={}))
+            db.commit()
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/users/{user_id}/status")
@@ -1254,6 +1303,18 @@ def admin_kill_switch(request: Request, enabled: bool = Form()):
         update_settings(outreach_kill_switch=enabled)
         set_setting(db, "outreach_kill_switch", "true" if enabled else "false")
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="kill_switch_changed", entity_type="system", detail={"enabled": enabled}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/system/settings")
+def admin_system_settings(request: Request, signup_enabled: bool = Form(True), maintenance_mode: bool = Form(False)):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        update_settings(signup_enabled=signup_enabled, maintenance_mode=maintenance_mode)
+        set_setting(db, "signup_enabled", "true" if signup_enabled else "false")
+        set_setting(db, "maintenance_mode", "true" if maintenance_mode else "false")
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="system_settings_changed", entity_type="system", detail={"signup_enabled": signup_enabled, "maintenance_mode": maintenance_mode}, ip_address=request.client.host if request.client else None))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 

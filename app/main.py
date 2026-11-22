@@ -84,6 +84,11 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             if request.url.query:
                 target = f"{target}?{request.url.query}"
             return RedirectResponse(f"/login?next={quote(target, safe='/?=&')}", status_code=303)
+        if request.session.get("authenticated") and request.url.path != "/verify-email" and not request.url.path.startswith("/static/"):
+            with SessionLocal() as db:
+                user = db.get(User, request.session.get("user_id")) if request.session.get("user_id") else None
+                if user and user.role == "user" and not user.email_verified_at:
+                    return RedirectResponse("/verify-email", status_code=303)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
@@ -262,6 +267,18 @@ def signup(
 
 @app.get("/verify-email")
 def verify_email(request: Request, token: str = ""):
+    if not token and request.session.get("user_id"):
+        with SessionLocal() as db:
+            user = db.get(User, request.session.get("user_id"))
+            if user and not user.email_verified_at:
+                raw = new_token()
+                db.add(EmailVerificationToken(user_id=user.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=24)))
+                db.commit()
+                try:
+                    send_system_email(user.email, "Verify your TailorMail account", f"Verify your account: {settings.base_url}/verify-email?token={raw}")
+                except Exception:
+                    pass
+                return templates.TemplateResponse(request, "auth_message.html", {"title": "Check your email", "message": "We sent a verification link. The link expires in 24 hours."})
     with SessionLocal() as db:
         record = db.scalar(select(EmailVerificationToken).where(EmailVerificationToken.token_hash == token_hash(token), EmailVerificationToken.used_at.is_(None), EmailVerificationToken.expires_at > utc_now())) if token else None
         if not record:

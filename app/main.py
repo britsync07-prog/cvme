@@ -761,6 +761,13 @@ def delete_account(request: Request):
         for token_model in (SessionToken, PasswordResetToken, EmailVerificationToken):
             for token in db.scalars(select(token_model).where(token_model.user_id == user.id)).all():
                 db.delete(token)
+        for row in db.scalars(select(AuditLog).where(AuditLog.user_id == user.id)).all():
+            row.user_id = None
+        for event in db.scalars(select(BillingEvent)).all():
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            metadata = payload.get("data", {}).get("object", {}).get("metadata", {}) if isinstance(payload.get("data"), dict) else {}
+            if str(metadata.get("workspace_id", "")) == str(workspace.id):
+                event.payload = {"redacted": True, "event_type": event.event_type}
         db.delete(workspace)
         user.is_active = False
         user.deleted_at = utc_now()
@@ -1169,6 +1176,9 @@ def admin_delete_user(request: Request, user_id: int):
         target.email = f"deleted-{target.id}@invalid.local"
         target.password_hash = None
         target.google_sub = None
+        for token_model in (SessionToken, PasswordResetToken, EmailVerificationToken):
+            for token in db.scalars(select(token_model).where(token_model.user_id == target.id)).all():
+                db.delete(token)
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="admin_user_deleted", entity_type="user", entity_id=target.id, detail={"workspace_ids": workspace_ids}, ip_address=request.client.host if request.client else None))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
@@ -1508,6 +1518,8 @@ def create_campaign(
         campaign_id = campaign.id
 
     if auto_prepare:
+        if request is not None and settings.environment == "production":
+            return queue_prepare_campaign(campaign_id, request)
         return prepare_campaign(campaign_id, request=request, workspace_id=workspace_id)
 
     return RedirectResponse(f"/campaigns/{campaign_id}", status_code=303)
@@ -1761,6 +1773,11 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
         db.commit()
         campaign = require_owned(db, Campaign, campaign_id, workspace)
         sender_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
+        if not sender_account and settings.environment == "production":
+            campaign.status = "ready"
+            audit(db, campaign, "send_blocked", "Connect a Gmail or SMTP sender for this workspace before sending.", user.id)
+            db.commit()
+            raise HTTPException(400, "Connect a Gmail or SMTP sender for this workspace before sending.")
         readiness_error = cv_outreach_readiness_error(campaign.candidate.cv_yaml)
         if readiness_error or not campaign.research or not campaign.research.get("sources"):
             readiness_error = readiness_error or "Company research and a public source are required before sending."
@@ -1811,6 +1828,7 @@ def delete_campaign(request: Request, campaign_id: int):
 @app.post("/settings")
 def save_settings(
     request: Request,
+    ai_provider: str = Form("custom"),
     base_url: str = Form(""),
     api_key: str = Form(""),
     llm_model: str = Form(""),
@@ -1852,14 +1870,17 @@ def save_settings(
         workspace.outreach_query = outreach_query.strip()
         workspace.outreach_target_role = outreach_target_role.strip()
         is_admin = user.role in {"admin", "superadmin"}
-        if api_key.strip():
-            config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
+        provider = ai_provider.strip().lower() if ai_provider.strip().lower() in {"openai", "anthropic", "gemini", "openrouter", "custom", "local"} else "custom"
+        config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
+        if config or api_key.strip():
             if not config:
-                config = AIProviderConfig(workspace_id=workspace.id, provider="custom", base_url=base_url.strip() or settings.base_url, encrypted_api_key=encrypt_secret(api_key.strip()), model_name=llm_model.strip() or settings.llm_model)
+                config = AIProviderConfig(workspace_id=workspace.id, provider=provider, base_url=base_url.strip() or settings.base_url, encrypted_api_key=encrypt_secret(api_key.strip()), model_name=llm_model.strip() or settings.llm_model)
                 db.add(config)
             else:
+                config.provider = provider
                 config.base_url = base_url.strip() or config.base_url
-                config.encrypted_api_key = encrypt_secret(api_key.strip())
+                if api_key.strip():
+                    config.encrypted_api_key = encrypt_secret(api_key.strip())
                 config.model_name = llm_model.strip() or config.model_name
             db.commit()
         db.commit()

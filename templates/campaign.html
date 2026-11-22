@@ -51,7 +51,7 @@
         <span class="step-num">1</span>
         <span class="step-label">Application Created</span>
       </div>
-      <div class="step {% if campaign.status in ['ready', 'sending', 'sent'] %}complete{% elif campaign.status == 'researching' %}active{% else %}pending{% endif %}">
+      <div class="step {% if campaign.status in ['ready', 'sending', 'sent'] %}complete{% elif campaign.status in ['queued', 'researching'] %}active{% else %}pending{% endif %}">
         <span class="step-num">2</span>
         <span class="step-label">Research & RenderCV Tailor</span>
       </div>
@@ -77,13 +77,9 @@
           <li><strong>RenderCV PDF Compilation:</strong> Compile the tailored YAML into a professional PDF using RenderCV.</li>
         </ol>
       </div>
-      <form action="/campaigns/{{ campaign.id }}/prepare" method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <button type="submit" class="button primary large">Research and tailor CV</button>
-      </form>
       <form action="/campaigns/{{ campaign.id }}/prepare/queue" method="post">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <button type="submit" class="button secondary large">Queue in background</button>
+        <button type="submit" class="button primary large">Queue research and tailor CV</button>
       </form>
     </div>
     {% endif %}

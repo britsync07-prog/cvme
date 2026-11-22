@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 import ipaddress
 import re
@@ -624,16 +625,36 @@ def test_llm_connection(base_url: str, api_key: str, model: str) -> dict:
 
 
 def send_system_email(recipient: str, subject: str, body: str) -> None:
-    """Send a transactional system email through the platform sender only."""
-    if not settings.resend_api_key or not settings.resend_from:
+    """Send a platform transactional message, never through a tenant sender."""
+    if settings.resend_api_key and settings.resend_from:
+        response = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+            json={
+                "from": settings.resend_from,
+                "to": [recipient],
+                "subject": subject,
+                "text": body,
+                "html": f"<main style='font-family:Arial,sans-serif;line-height:1.5'><h2>TailorMail</h2><p>{html.escape(body).replace(chr(10), '<br>')}</p></main>",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
         return
-    response = httpx.post(
-        "https://api.resend.com/emails",
-        headers={"Authorization": f"Bearer {settings.resend_api_key}"},
-        json={"from": settings.resend_from, "to": [recipient], "subject": subject, "text": body},
-        timeout=30,
-    )
-    response.raise_for_status()
+    if not settings.smtp_host or not settings.smtp_from:
+        return
+    message = EmailMessage()
+    message["From"] = settings.smtp_from
+    message["To"] = recipient
+    message["Subject"] = subject
+    message.set_content(body)
+    message.add_alternative(f"<main style='font-family:Arial,sans-serif;line-height:1.5'><h2>TailorMail</h2><p>{html.escape(body).replace(chr(10), '<br>')}</p></main>", subtype="html")
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as client:
+        if settings.smtp_use_tls:
+            client.starttls()
+        if settings.smtp_username:
+            client.login(settings.smtp_username, settings.smtp_password)
+        client.send_message(message)
 
 
 def test_smtp_connection(

@@ -17,8 +17,8 @@
       </div>
     </div>
     <div class="nav-badges">
-      <span class="badge api-badge" title="Target LLM API">LLM configured</span>
-      <span class="badge smtp-badge" title="Email delivery status">{% if settings.smtp_host or settings.resend_api_key %}Email configured{% else %}Email unconfigured{% endif %}</span>
+      <span class="badge api-badge" title="Target LLM API">{% if ai_config %}LLM configured{% else %}LLM unconfigured{% endif %}</span>
+      <span class="badge smtp-badge" title="Email delivery status">{% if email_account %}Email configured{% else %}Email unconfigured{% endif %}</span>
     </div>
   </header>
 
@@ -358,13 +358,23 @@
         </div>
       </div>
 
-      <form action="/settings" method="post" class="standard-form">
+      <form id="email-account-form" action="/settings/email-account" method="post"></form>
+      <form id="blocklist-form" action="/settings/blocklist" method="post"></form>
+      <form id="disconnect-form" action="/settings/email-account/disconnect" method="post"></form>
+      <form id="settings-form" action="/settings" method="post" class="standard-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <div class="settings-section">
           <h3>🤖 LLM Intelligence Engine</h3>
           <p class="subtitle">Connects to your local or hosted OpenAI-compatible endpoint for truthful CV adaptation.</p>
 
           <div class="form-row">
+            <label class="field">
+              <span>Provider preset</span>
+              <select name="ai_provider">
+                {% set current_provider = ai_config.provider if ai_config else 'custom' %}
+                {% for provider in ['openai', 'anthropic', 'gemini', 'openrouter', 'local', 'custom'] %}<option value="{{ provider }}" {% if current_provider == provider %}selected{% endif %}>{{ provider|capitalize }}</option>{% endfor %}
+              </select>
+            </label>
             <label class="field">
               <span>API Base URL <strong class="req">*</strong></span>
               <input name="base_url" id="base_url" value="{{ ai_config.base_url if ai_config else settings.base_url }}" placeholder="http://127.0.0.1:31415" required>
@@ -444,8 +454,8 @@
             </div>
           </div>
           <div id="smtp-test-result" class="test-feedback"></div>
-          <div class="panel-header"><div><h3>Workspace sender</h3><p class="subtitle">{{ email_account.email if email_account else 'No tenant sender connected' }}. Connect Gmail or save encrypted SMTP credentials below.</p></div><div><a class="button-link" href="/settings/gmail/connect">Connect Gmail</a>{% if email_account %}<form method="post" action="/settings/email-account/disconnect" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small danger" type="submit">Disconnect</button></form>{% endif %}</div></div>
-          <form action="/settings/email-account" method="post" class="standard-form"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><div class="form-row"><label class="field"><span>SMTP from email</span><input name="email" type="email" placeholder="you@company.com" required></label><label class="field"><span>SMTP host</span><input name="host" placeholder="smtp.example.com" required></label></div><div class="form-row"><label class="field"><span>Port</span><input name="port" type="number" value="587"></label><label class="field"><span>Username</span><input name="username"></label></div><div class="form-row"><label class="field"><span>Password</span><input name="password" type="password"></label><label class="checkbox-label"><input name="use_tls" type="checkbox" value="true" checked><span>Use TLS</span></label></div><button class="button secondary" type="submit">Save encrypted SMTP account</button></form>
+          <div class="panel-header"><div><h3>Workspace sender</h3><p class="subtitle">{{ email_account.email if email_account else 'No tenant sender connected' }}. Connect Gmail or save encrypted SMTP credentials below.</p></div><div><a class="button-link" href="/settings/gmail/connect">Connect Gmail</a>{% if email_account %}<span style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}" form="disconnect-form"><button class="button small danger" type="submit" form="disconnect-form">Disconnect</button></span>{% endif %}</div></div>
+          <div class="standard-form"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}" form="email-account-form"><div class="form-row"><label class="field"><span>SMTP from email</span><input name="email" type="email" placeholder="you@company.com" required form="email-account-form"></label><label class="field"><span>SMTP host</span><input name="host" placeholder="smtp.example.com" required form="email-account-form"></label></div><div class="form-row"><label class="field"><span>Port</span><input name="port" type="number" value="587" form="email-account-form"></label><label class="field"><span>Username</span><input name="username" form="email-account-form"></label></div><div class="form-row"><label class="field"><span>Password</span><input name="password" type="password" form="email-account-form"></label><label class="checkbox-label"><input name="use_tls" type="checkbox" value="true" checked form="email-account-form"><span>Use TLS</span></label></div><button class="button secondary" type="submit" form="email-account-form">Save encrypted SMTP account</button></div>
         </div>
 
         <div class="settings-section">
@@ -469,7 +479,7 @@
             </label>
             <label class="field">
               <span>Daily lead limit</span>
-              <input name="outreach_daily_limit" type="number" min="1" max="100" value="{{ settings.outreach_daily_limit }}">
+            <input name="outreach_daily_limit" type="number" min="1" max="100" value="{{ workspace.daily_limit }}">
             </label>
           </div>
           <div class="form-row">
@@ -482,20 +492,20 @@
               <input name="outreach_target_role" value="{{ workspace.outreach_target_role }}" placeholder="e.g. Software Engineer">
             </label>
           </div>
-          <label class="field"><span>Daily schedule timezone</span><input name="outreach_timezone" value="{{ settings.outreach_timezone }}" placeholder="e.g. Asia/Dhaka"></label>
+          <label class="field"><span>Daily schedule timezone</span><input name="outreach_timezone" value="{{ workspace.timezone }}" placeholder="e.g. Asia/Dhaka"></label>
           <label class="field"><span>Daily schedule time</span><input name="outreach_schedule_time" type="time" value="{{ workspace.schedule_time }}"></label>
-          <label class="checkbox-label"><input name="outreach_auto_send" type="checkbox" value="true" {% if settings.outreach_auto_send %}checked{% endif %}><span>Automatically send after a successful preparation.</span></label>
+          <label class="checkbox-label"><input name="outreach_auto_send" type="checkbox" value="true" {% if workspace.outreach_auto_send %}checked{% endif %}><span>Automatically send after a successful preparation.</span></label>
           <input type="hidden" name="outreach_policy" value="review_required">
         </div>
 
         <div class="settings-section">
           <h3>Workspace blocklist</h3>
           <p class="subtitle">Blocked domains are skipped for this workspace before research, tailoring, or delivery.</p>
-          <form action="/settings/blocklist" method="post" class="form-row">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-            <label class="field"><span>Company domain</span><input name="domain" type="text" placeholder="example.co.uk" required></label>
-            <div class="field"><span>&nbsp;</span><button class="button secondary" type="submit">Add to blocklist</button></div>
-          </form>
+          <div class="form-row">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}" form="blocklist-form">
+            <label class="field"><span>Company domain</span><input name="domain" type="text" placeholder="example.co.uk" required form="blocklist-form"></label>
+            <div class="field"><span>&nbsp;</span><button class="button secondary" type="submit" form="blocklist-form">Add to blocklist</button></div>
+          </div>
           {% if blocklist %}<div class="tag-list">{% for item in blocklist %}<span class="tag">{{ item.domain }}</span>{% endfor %}</div>{% else %}<p class="muted">No workspace domains blocked.</p>{% endif %}
         </div>
 

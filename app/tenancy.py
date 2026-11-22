@@ -94,8 +94,14 @@ def require_owned(db, model, object_id: int, workspace: Workspace):
     # startup backfills these, but direct CLI/test calls may reach this first.
     if not item:
         legacy_item = db.scalar(select(model).where(model.id == object_id, model.workspace_id.is_(None)))
-        if legacy_item:
+        # A null workspace is only a pre-migration record. It may be claimed
+        # by the migrated owner workspace while no other live workspace
+        # exists; never let a newly created tenant claim legacy data.
+        live_workspaces = db.scalar(select(Workspace.id).where(Workspace.deleted_at.is_(None)).limit(2).offset(1))
+        if legacy_item and workspace.slug == "owner" and live_workspaces is None:
             legacy_item.workspace_id = workspace.id
+            if hasattr(legacy_item, "user_id"):
+                legacy_item.user_id = workspace.owner_user_id
             db.flush()
             item = legacy_item
     if not item or getattr(item, "deleted_at", None) is not None:

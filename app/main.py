@@ -794,7 +794,8 @@ def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
     if workspace:
         plan_limit = int(status_for(db, workspace)["limits"].get("daily_emails", daily_limit))
         daily_limit = min(daily_limit, plan_limit)
-        age_days = max((utc_now() - workspace.created_at).days, 0)
+        created_at = workspace.created_at.replace(tzinfo=timezone.utc) if workspace.created_at.tzinfo is None else workspace.created_at
+        age_days = max((utc_now() - created_at).days, 0)
         if age_days < 7:
             daily_limit = min(daily_limit, max(5, (age_days + 1) * 5))
     return max(daily_limit - sent_today, 0)

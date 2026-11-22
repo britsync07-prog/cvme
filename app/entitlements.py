@@ -14,6 +14,10 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def _aware(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
 def subscription_for(db, workspace: Workspace):
     return db.scalar(select(Subscription).where(Subscription.workspace_id == workspace.id).order_by(Subscription.id.desc()))
 
@@ -53,7 +57,7 @@ def require_send_slot(db, workspace: Workspace) -> None:
     status = require_feature(db, workspace, "daily_emails")
     limit = int(status["limits"].get("daily_emails", settings.outreach_daily_limit))
     limit = min(limit, max(int(workspace.daily_limit or limit), 1))
-    age_days = max((_now() - workspace.created_at).days, 0)
+    age_days = max((_now() - _aware(workspace.created_at)).days, 0)
     if age_days < 7:
         limit = min(limit, max(5, (age_days + 1) * 5))
     local = datetime.now(ZoneInfo(workspace.timezone))

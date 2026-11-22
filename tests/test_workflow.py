@@ -10,6 +10,7 @@ import zipfile
 
 import pytest
 import yaml
+from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from fastapi.responses import JSONResponse
 
@@ -28,6 +29,8 @@ def init_db(monkeypatch):
     monkeypatch.setattr(main.settings, "admin_username", "")
     monkeypatch.setattr(main.settings, "admin_password", "")
     monkeypatch.setattr(services.settings, "environment", "development")
+    monkeypatch.setattr(main.settings, "encryption_key", Fernet.generate_key().decode())
+    monkeypatch.setattr(services.settings, "encryption_key", main.settings.encryption_key)
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
@@ -467,7 +470,7 @@ def test_campaign_page_explains_thin_cv_send_block():
             recipient_email="careers@acme.example",
             status="ready",
             email_subject="Application",
-            email_body="Attached.",
+            email_body="Dear Acme Corp, my CV is attached.",
         )
         db.add(campaign)
         db.commit()
@@ -486,7 +489,7 @@ def test_tailor_prompt_guardrails(monkeypatch):
     payload = {
         "cv_yaml": "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Backend Engineer\n  sections: {}\n",
         "email_subject": "Application – Backend Engineer",
-        "email_body": "Dear Hiring Team, My CV is attached.",
+        "email_body": "Dear Acme Corp, my CV is attached.",
     }
 
     class MockResponse:
@@ -573,7 +576,7 @@ def test_tailor_restores_the_source_rendercv_design(monkeypatch):
     payload = {
         "cv_yaml": "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Tailored\n  sections: {}\n  design:\n    theme: modern\n",
         "email_subject": "Application",
-        "email_body": "Attached.",
+        "email_body": "Dear Acme Corp, my CV is attached.",
     }
 
     class MockResponse:
@@ -619,7 +622,7 @@ design:
   theme: classic
 """,
         "email_subject": "Application",
-        "email_body": "Attached.",
+        "email_body": "Dear Acme Corp, my CV is attached.",
     }
 
     class MockResponse:
@@ -764,7 +767,7 @@ def test_full_pipeline_end_to_end(monkeypatch, tmp_path):
         lambda *args, **kwargs: {
             "cv_yaml": tailored_source,
             "email_subject": "Application: Lead Cloud Architect – Test Person",
-            "email_body": "Dear DeepTech Team,\n\nI am applying for the Lead Cloud Architect role.\nMy CV is attached.",
+            "email_body": "Dear DeepTech Labs Team,\n\nI am applying for the Lead Cloud Architect role.\nMy CV is attached.",
         },
     )
 
@@ -821,7 +824,7 @@ def test_full_pipeline_end_to_end(monkeypatch, tmp_path):
             "/campaigns/1/update-email",
             data={
                 "email_subject": "Application: Lead Cloud Architect (Updated)",
-                "email_body": "Dear Hiring Team,\n\nUpdated cover note. My CV is attached.",
+                    "email_body": "Dear DeepTech Labs Hiring Team,\n\nUpdated cover note. My CV is attached.",
             },
             follow_redirects=False,
         )

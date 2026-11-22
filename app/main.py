@@ -109,7 +109,7 @@ def rate_limited(request: Request, bucket: str, limit: int, window: int = 900) -
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        public_paths = {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/cookies", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
+        public_paths = {"/", "/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/cookies", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
         if settings.maintenance_mode and request.url.path not in public_paths and not request.url.path.startswith("/static/") and not request.session.get("authenticated"):
             return PlainTextResponse("TailorMail is temporarily under maintenance.", status_code=503)
         if (
@@ -276,15 +276,46 @@ def pricing_page(request: Request):
 
 def _legal_page(request: Request, page_name: str):
     pages = {
-        "terms": ("Terms of service", "Use TailorMail responsibly and keep your account credentials secure."),
-        "privacy": ("Privacy policy", "Workspace data is isolated and used to operate the features you configure."),
-        "acceptable-use": ("Acceptable use", "Do not use TailorMail for spam, unlawful profiling, harassment, or deceptive outreach."),
-        "refunds": ("Refund policy", "Subscription refunds are handled according to the plan and billing terms shown at checkout."),
-        "contact": ("Contact", "Contact support through your workspace support channel."),
-        "cookies": ("Cookie notice", "TailorMail uses an HttpOnly session cookie to keep you signed in and essential security state for CSRF and OAuth. We do not use advertising cookies."),
+        "terms": {"title": "Terms of service", "intro": "These terms govern your use of TailorMail, the workflow that helps you research companies and prepare company-specific applications.", "sections": [
+            {"heading": "Your account", "paragraphs": ["You must provide accurate account information, protect your credentials, and keep your workspace access private. You are responsible for activity performed through your account."], "bullets": []},
+            {"heading": "Your content and AI output", "paragraphs": ["You retain ownership of CVs, leads, prompts, and other content you submit. You are responsible for checking every generated CV, email, claim, and recipient before sending. TailorMail does not guarantee that AI output is accurate, complete, or suitable for a particular role."], "bullets": []},
+            {"heading": "Acceptable use", "paragraphs": ["You must comply with applicable marketing, privacy, employment, and anti-spam laws. Do not use the service for deception, harassment, unlawful profiling, bulk unsolicited messages, or content you do not have the right to use."], "bullets": []},
+            {"heading": "Plans, trials, and suspension", "paragraphs": ["Trials and paid plans are described on the pricing page. We may pause sending or suspend an account to protect recipients, sender reputation, or the service, including when bounce or complaint rates are unsafe."], "bullets": []},
+            {"heading": "Service limits", "paragraphs": ["The service is provided on an availability basis. To the extent permitted by law, TailorMail is not liable for indirect loss, missed opportunities, or decisions made from generated output."], "bullets": []},
+            {"heading": "Contact", "paragraphs": ["Questions about these terms can be sent to support@ascentraconsulting.co.uk."], "bullets": []},
+        ]},
+        "privacy": {"title": "Privacy policy", "intro": "This policy explains what TailorMail stores, why it is needed, and the controls available to each workspace.", "sections": [
+            {"heading": "Information we process", "paragraphs": ["We process account and workspace details, uploaded CV files, candidate facts, company and lead records, research notes, generated documents, delivery events, support requests, and security/audit events."], "bullets": []},
+            {"heading": "Why we process it", "paragraphs": ["We use this information to provide the application workflow, tailor documents, send messages you approve, enforce limits, prevent abuse, provide support, and maintain reliable and secure infrastructure."], "bullets": []},
+            {"heading": "Connected providers", "paragraphs": ["If you connect an AI provider, Gmail, SMTP, Companies House, payment, or delivery provider, the service exchanges only the data needed for the feature you enable. Provider credentials and tokens are encrypted at rest and masked in the interface."], "bullets": []},
+            {"heading": "Retention and your rights", "paragraphs": ["You can export or delete workspace data from the account controls. We retain limited security, billing, suppression, and audit records where necessary for legal compliance, fraud prevention, or dispute handling. Contact us to request access, correction, restriction, or deletion."], "bullets": []},
+            {"heading": "Security", "paragraphs": ["Workspace records are scoped by workspace ID, sensitive credentials are encrypted, and administrative actions are audit logged. No internet service can promise absolute security; report suspected incidents promptly."], "bullets": []},
+            {"heading": "Contact", "paragraphs": ["For privacy requests, email support@ascentraconsulting.co.uk."], "bullets": []},
+        ]},
+        "acceptable-use": {"title": "Acceptable use policy", "intro": "TailorMail is for careful, relevant professional outreach. This policy protects recipients, users, and sender reputation.", "sections": [
+            {"heading": "You may not", "paragraphs": [], "bullets": ["Send deceptive, abusive, threatening, discriminatory, or unlawful content.", "Harvest or target personal addresses when a lawful corporate address is not available.", "Ignore an opt-out, suppression request, bounce, or complaint.", "Misrepresent your identity, experience, employer, or relationship with a recipient.", "Circumvent daily limits, provider controls, or account suspension." ]},
+            {"heading": "Required sending practice", "paragraphs": ["Use a real sender identity, a relevant subject, truthful claims, and the opt-out mechanism provided by the service. Review AI output and recipient evidence before every send. TailorMail may skip unverified recipients or pause accounts with unsafe delivery signals."], "bullets": []},
+            {"heading": "Enforcement", "paragraphs": ["We may block a recipient or domain, pause a campaign, limit sending, or suspend an account while investigating abuse. We may preserve relevant audit records and cooperate with lawful requests."], "bullets": []},
+        ]},
+        "refunds": {"title": "Refund policy", "intro": "Our billing policy is designed to make trials and cancellation clear.", "sections": [
+            {"heading": "Free trial", "paragraphs": ["A trial provides access for the period shown at signup. No charge is made unless you start a paid subscription or otherwise confirm a paid checkout."], "bullets": []},
+            {"heading": "Subscriptions", "paragraphs": ["Paid plans renew for the selected billing interval until cancelled. Cancellation stops the next renewal; access normally remains available through the paid period."], "bullets": []},
+            {"heading": "Refund requests", "paragraphs": ["If a duplicate charge, billing error, or exceptional circumstance occurs, contact support@ascentraconsulting.co.uk with the workspace and invoice details. Approved refunds are returned through the original payment method. Processing times depend on the payment provider."], "bullets": []},
+            {"heading": "Failed payments", "paragraphs": ["We may retry a failed payment and temporarily restrict sending while the account is past due. You remain responsible for valid payment details during an active subscription."], "bullets": []},
+        ]},
+        "contact": {"title": "Contact TailorMail", "intro": "We are here for account, privacy, billing, and delivery questions.", "sections": [
+            {"heading": "Support", "paragraphs": ["Email support@ascentraconsulting.co.uk with your workspace name, the affected campaign or message ID, and a short description. Never include an API key, password, or OAuth token in a support request."], "bullets": []},
+            {"heading": "Responsible disclosure", "paragraphs": ["If you find a security issue, include reproduction steps and avoid accessing or changing other users' data. We will acknowledge reports as soon as practical."], "bullets": []},
+            {"heading": "Business details", "paragraphs": ["TailorMail is operated through Ascentra Consulting. See the Terms and Privacy pages for service and data-handling details."], "bullets": []},
+        ]},
+        "cookies": {"title": "Cookie notice", "intro": "TailorMail uses a small number of essential cookies to keep the application secure.", "sections": [
+            {"heading": "Essential session state", "paragraphs": ["An HttpOnly, secure session cookie maintains sign-in state, CSRF protection, and OAuth handoffs. These cookies are required for authenticated features and are not used to build an advertising profile."], "bullets": []},
+            {"heading": "No advertising cookies", "paragraphs": ["We do not use third-party advertising cookies or sell browsing information. Public pages may include ordinary server logs for security and reliability."], "bullets": []},
+            {"heading": "Your choices", "paragraphs": ["You can clear cookies in your browser. Clearing essential cookies will sign you out and may prevent the application from working until they are enabled again."], "bullets": []},
+        ]},
     }
-    title, body = pages[page_name]
-    return templates.TemplateResponse(request, "legal.html", {"title": title, "body": body})
+    page = pages[page_name]
+    return templates.TemplateResponse(request, "legal.html", {"title": page["title"], "intro": page["intro"], "sections": page["sections"]})
 
 
 @app.get("/terms")
@@ -925,6 +956,8 @@ def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
 
 @app.get("/")
 def dashboard(request: Request, tab: str = "applications"):
+    if settings.environment == "production" and not request.session.get("authenticated"):
+        return RedirectResponse("/landing", status_code=303)
     with SessionLocal() as db:
         workspace, _ = current_workspace(request, db)
         campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)).order_by(Campaign.created_at.desc())).all()

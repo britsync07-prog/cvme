@@ -1,1 +1,37 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ title }} · TailorMail</title><link rel="stylesheet" href="/static/app.css"></head><body><main class="public-shell"><nav class="public-nav"><a class="brand" href="/landing"><span class="logo-mark">TM</span><span class="app-title">TailorMail</span></a></nav><article class="panel public-trust"><h1>{{ title }}</h1><p>{{ body }}</p><p>TailorMail users are responsible for lawful outreach, consent, opt-outs, and compliance with applicable privacy and electronic-marketing laws.</p></article></main></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{{ title }} for TailorMail">
+  <title>{{ title }} - TailorMail</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main class="public-shell">
+    <nav class="public-nav" aria-label="Public navigation">
+      <a class="brand" href="/landing"><span class="logo-mark">TM</span><span class="app-title">TailorMail</span></a>
+      <div class="public-links"><a href="/landing">Home</a><a href="/pricing">Pricing</a><a href="/contact">Contact</a><a class="button-link" href="/signup">Start free trial</a></div>
+    </nav>
+    <article class="legal-page">
+      <div class="legal-header">
+        <p class="eyebrow">TailorMail policy</p>
+        <h1>{{ title }}</h1>
+        <p class="legal-intro">{{ intro }}</p>
+        <p class="legal-meta">Effective 22 November 2026 · Last reviewed 22 November 2026</p>
+      </div>
+      <div class="legal-sections">
+        {% for section in sections %}
+        <section class="legal-section">
+          <h2>{{ section.heading }}</h2>
+          {% for paragraph in section.paragraphs %}<p>{{ paragraph }}</p>{% endfor %}
+          {% if section.bullets %}<ul>{% for bullet in section.bullets %}<li>{{ bullet }}</li>{% endfor %}</ul>{% endif %}
+        </section>
+        {% endfor %}
+      </div>
+      <p class="legal-disclaimer">TailorMail users are responsible for lawful outreach, consent, opt-outs, and compliance with applicable privacy and electronic-marketing laws.</p>
+    </article>
+    <footer class="public-footer"><span>TailorMail by Ascentra Consulting</span><span><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/acceptable-use">Acceptable use</a><a href="/refunds">Refunds</a><a href="/cookies">Cookies</a></span></footer>
+  </main>
+</body>
+</html>

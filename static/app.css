@@ -1009,6 +1009,34 @@ main.main-content .panel {
   justify-content: flex-end;
 }
 
+/* Public pages: same TailorMail tokens, with enough structure for real policy copy. */
+.public-links { display: flex; align-items: center; gap: 18px; }
+.public-links a:not(.button-link), .public-footer a { color: var(--text-muted); text-decoration: none; }
+.public-links a:not(.button-link):hover, .public-footer a:hover { color: var(--primary); }
+.legal-page { max-width: 940px; margin: 42px auto 80px; }
+.legal-header { max-width: 760px; margin-bottom: 34px; }
+.legal-header h1 { margin-bottom: 14px; }
+.legal-intro { font-size: 18px; line-height: 1.65; color: var(--text-main); }
+.legal-meta { color: var(--text-muted); font-size: 13px; }
+.legal-sections { display: grid; gap: 14px; }
+.legal-section { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 24px 28px; }
+.legal-section h2 { margin: 0 0 10px; font-size: 20px; }
+.legal-section p { margin: 8px 0; line-height: 1.65; }
+.legal-section ul { margin: 10px 0 0; padding-left: 22px; line-height: 1.7; }
+.legal-disclaimer { margin: 26px 0 0; color: var(--text-muted); font-size: 13px; }
+.public-footer { max-width: 1080px; margin: 0 auto; padding: 24px 0 42px; display: flex; justify-content: space-between; gap: 20px; color: var(--text-muted); font-size: 13px; }
+.public-footer span:last-child { display: flex; gap: 16px; flex-wrap: wrap; justify-content: flex-end; }
+.pricing-toggle { display: flex; justify-content: center; gap: 10px; margin-top: 24px; }
+.pricing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; max-width: 1080px; margin: 0 auto; }
+.pricing-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 28px; display: flex; flex-direction: column; gap: 8px; }
+.pricing-card h2 { margin: 0; font-size: 30px; }
+.pricing-card h2 small { font-size: 13px; color: var(--text-muted); font-weight: 500; }
+.pricing-card p { line-height: 1.55; }
+.pricing-card .button { margin-top: auto; align-self: flex-start; }
+.pricing-featured { border-color: var(--primary); }
+.pricing-note { max-width: 1080px; margin: 26px auto 0; color: var(--text-muted); text-align: center; }
+@media (max-width: 760px) { .public-links { gap: 10px; } .public-links a:not(.button-link) { display: none; } .legal-page { margin: 28px 0 48px; } .legal-section { padding: 20px; } .pricing-grid { grid-template-columns: 1fr; } .public-footer { flex-direction: column; } .public-footer span:last-child { justify-content: flex-start; } }
+
 /* Empty State */
 .empty-state {
   text-align: center;

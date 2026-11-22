@@ -58,6 +58,11 @@ services:
     command: ["python", "-m", "app.worker"]
     volumes:
       - artifacts:/app/artifacts
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.config import settings; import redis; redis.Redis.from_url(settings.redis_url).ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
   scheduler:
@@ -70,6 +75,11 @@ services:
         condition: service_healthy
     entrypoint: ["/app/scripts/start_worker.sh"]
     command: ["python", "-m", "app.scheduler"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from app.config import settings; import redis; redis.Redis.from_url(settings.redis_url).ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
 
 volumes:

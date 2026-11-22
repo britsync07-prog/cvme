@@ -18,7 +18,7 @@ import httpx
 import yaml
 
 from .config import settings
-from .security import decrypt_secret
+from .security import decrypt_secret, encrypt_secret
 
 
 LLM_TIMEOUT_SECONDS = 300
@@ -460,6 +460,8 @@ Original RenderCV YAML:
     for key in ("cv_yaml", "email_subject", "email_body"):
         if not isinstance(result.get(key), str) or not result[key].strip():
             raise ValueError(f"LLM response missing {key}")
+    if company_name.casefold() not in result["email_body"].casefold():
+        raise ValueError("AI email must mention the researched company by name.")
 
     tailored_data = yaml.safe_load(result["cv_yaml"])
     if not isinstance(tailored_data, dict):
@@ -543,6 +545,9 @@ def send_email(recipient: str, subject: str, body: str, attachment: Path, email_
                 response.raise_for_status()
                 token = response.json()
                 access_token = token["access_token"]
+                credentials["access_token"] = access_token
+                credentials["expires_at"] = int(datetime.now(timezone.utc).timestamp()) + int(token.get("expires_in", 3600))
+                email_account.encrypted_credentials = encrypt_secret(json.dumps(credentials))
             if not access_token:
                 raise RuntimeError("Gmail authorization has expired. Reconnect Gmail.")
             message = EmailMessage()

@@ -27,7 +27,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_feature, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, PasswordResetToken, Plan, Subscription, SupportTicket, Suppression, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, PasswordResetToken, Plan, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
@@ -295,7 +295,7 @@ def contact_page(request: Request):
 
 @app.get("/robots.txt", include_in_schema=False)
 def robots():
-    return PlainTextResponse("User-agent: *\nAllow: /landing\nAllow: /pricing\n")
+    return PlainTextResponse("User-agent: *\nAllow: /landing\nAllow: /pricing\nDisallow: /\n")
 
 
 @app.get("/sitemap.xml", include_in_schema=False)
@@ -714,7 +714,8 @@ def unsubscribe(email: str, workspace_id: int | None = None):
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
         raise HTTPException(400, "A valid email address is required.")
     with SessionLocal() as db:
-        db.add(Suppression(workspace_id=workspace_id, email=normalized, reason="unsubscribe"))
+        # Public opt-outs are global by design; callers cannot suppress an arbitrary tenant by guessing an ID.
+        db.add(Suppression(workspace_id=None, email=normalized, reason="unsubscribe"))
         db.commit()
     return PlainTextResponse("You have been unsubscribed.")
 
@@ -1227,6 +1228,7 @@ def prepare_campaign(campaign_id: int, request: Request = None, workspace_id: in
                 job_description=campaign.job_description,
                 ai_config=db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id)),
             )
+            db.add(UsageRecord(workspace_id=workspace.id, user_id=campaign.user_id, metric="ai_requests", quantity=1, period_start=utc_now().replace(hour=0, minute=0, second=0, microsecond=0)))
 
             campaign.tailored_yaml = result["cv_yaml"]
             campaign.email_subject = result["email_subject"]
@@ -1322,7 +1324,8 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
         db.commit()
         campaign = require_owned(db, Campaign, campaign_id, workspace)
         readiness_error = cv_outreach_readiness_error(campaign.candidate.cv_yaml)
-        if readiness_error:
+        if readiness_error or not campaign.research or not campaign.research.get("sources"):
+            readiness_error = readiness_error or "Company research and a public source are required before sending."
             campaign.status = "ready"
             audit(db, campaign, "send_blocked", readiness_error)
             db.commit()

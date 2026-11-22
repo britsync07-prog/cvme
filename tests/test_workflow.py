@@ -21,7 +21,13 @@ from app.models import Campaign, Candidate
 
 
 @pytest.fixture(autouse=True)
-def init_db():
+def init_db(monkeypatch):
+    # Tests exercise the application in its local, unauthenticated development mode.
+    # Production authentication/CSRF is covered by explicit smoke checks and deployment tests.
+    monkeypatch.setattr(main.settings, "environment", "development")
+    monkeypatch.setattr(main.settings, "admin_username", "")
+    monkeypatch.setattr(main.settings, "admin_password", "")
+    monkeypatch.setattr(services.settings, "environment", "development")
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield

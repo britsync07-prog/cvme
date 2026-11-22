@@ -474,11 +474,12 @@ def login(request: Request, username: str = Form(""), password: str = Form(""), 
     if settings.admin_username and secrets.compare_digest(username, settings.admin_username) and secrets.compare_digest(password, settings.admin_password):
         with SessionLocal() as db:
             workspace, user = ensure_default_workspace(db)
+            workspace_id, user_id = workspace.id, user.id
             db.commit()
         request.session.clear()
         request.session["authenticated"] = True
-        request.session["workspace_id"] = workspace.id
-        request.session["user_id"] = user.id
+        request.session["workspace_id"] = workspace_id
+        request.session["user_id"] = user_id
         return RedirectResponse(_safe_next(next), status_code=303)
     return templates.TemplateResponse(
         request,

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     resend_api_key: str = ""
     resend_from: str = ""
+    resend_webhook_secret: str = ""
     companies_house_api_key: str = ""
     scrapollo_binary: str = "scrapollo"
     scrapollo_cookie_file: str = ""

@@ -97,7 +97,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if (
             settings.admin_username
-            and request.url.path not in {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe"}
+            and request.url.path not in {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
             and not request.url.path.startswith("/static/")
             and not request.session.get("authenticated")
         ):
@@ -129,7 +129,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
 class CSRFMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/healthz", "/billing/webhook", "/unsubscribe"}:
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/healthz", "/billing/webhook", "/unsubscribe", "/webhooks/resend"}:
             if settings.environment != "production":
                 return await call_next(request)
             body = await request.body()
@@ -594,6 +594,31 @@ async def billing_webhook(request: Request):
     return {"ok": True}
 
 
+@app.post("/webhooks/resend", include_in_schema=False)
+async def resend_webhook(request: Request):
+    """Handle Resend bounce/complaint events and immediately suppress recipients."""
+    body = await request.body()
+    if settings.resend_webhook_secret:
+        supplied = request.headers.get("x-tailormail-signature", "")
+        expected = hmac.new(settings.resend_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            raise HTTPException(401, "Invalid webhook signature.")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "Invalid webhook payload.") from exc
+    event_type = str(payload.get("type", ""))
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    recipient = str(data.get("to") or data.get("email") or "").strip().lower()
+    if event_type not in {"email.bounced", "email.complained", "email.delivery_failed"} or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient):
+        return {"ok": True, "suppressed": False}
+    with SessionLocal() as db:
+        if not db.scalar(select(Suppression).where(Suppression.workspace_id.is_(None), Suppression.email == recipient, Suppression.reason.in_(["bounce", "complaint"]))):
+            db.add(Suppression(workspace_id=None, email=recipient, reason="complaint" if event_type == "email.complained" else "bounce"))
+            db.commit()
+    return {"ok": True, "suppressed": True}
+
+
 @app.get("/billing")
 def billing_page(request: Request, success: int = 0):
     with SessionLocal() as db:
@@ -639,6 +664,24 @@ def billing_portal(request: Request):
     if response.status_code >= 400:
         raise HTTPException(502, "Stripe portal could not be opened.")
     return RedirectResponse(response.json().get("url", "/billing"), status_code=303)
+
+
+@app.post("/admin/payments/{payment_id}/refund")
+def admin_refund_payment(request: Request, payment_id: int):
+    if not settings.stripe_secret_key:
+        raise HTTPException(503, "Stripe billing is not configured.")
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        payment = db.get(Payment, payment_id)
+        if not payment or not payment.provider_payment_id:
+            raise HTTPException(404, "Refundable payment not found.")
+        response = httpx.post("https://api.stripe.com/v1/refunds", data={"payment_intent": payment.provider_payment_id}, auth=(settings.stripe_secret_key, ""), timeout=30)
+        if response.status_code >= 400:
+            raise HTTPException(502, "Stripe refund could not be created.")
+        payment.status = "refunded"
+        db.add(AuditLog(workspace_id=payment.workspace_id, user_id=actor.id, action="payment_refunded", entity_type="payment", entity_id=payment.id, detail={"provider_payment_id": payment.provider_payment_id}))
+        db.commit()
+    return RedirectResponse("/billing", status_code=303)
 
 
 @app.post("/account/delete")

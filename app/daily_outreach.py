@@ -26,11 +26,11 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
         elif settings.outreach_candidate_id:
             workspace, _ = ensure_default_workspace(db)
         if workspace:
-            configured_candidate = workspace.outreach_candidate_id
-            configured_query = workspace.outreach_query
-            configured_role = workspace.outreach_target_role
-            configured_limit = workspace.daily_limit
-            configured_timezone = workspace.timezone
+            configured_candidate = workspace.outreach_candidate_id or configured_candidate
+            configured_query = workspace.outreach_query or configured_query
+            configured_role = workspace.outreach_target_role or configured_role
+            configured_limit = workspace.daily_limit or configured_limit
+            configured_timezone = workspace.timezone or configured_timezone
             if workspace.paused:
                 errors.append("Workspace outreach is paused.")
         elif workspace_id:
@@ -49,7 +49,7 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
         with SessionLocal() as db:
             sender = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == (workspace_id or (ensure_default_workspace(db)[0].id)), EmailAccount.status == "active"))
         if not sender and not (settings.resend_api_key and settings.resend_from):
-            errors.append("Configured automatic sending requires a connected workspace sender.")
+            errors.append("Configured automatic sending requires Resend or SMTP / a connected workspace sender.")
     try:
         ZoneInfo(configured_timezone)
     except ZoneInfoNotFoundError:
@@ -83,7 +83,10 @@ def main(workspace_id: int | None = None) -> None:
     totals = {"discovered": 0, "completed": 0, "sent": 0}
     while True:
         with SessionLocal() as db:
-            remaining = remaining_daily_send_budget(db, workspace_id)
+            try:
+                remaining = remaining_daily_send_budget(db, workspace_id)
+            except TypeError:  # compatibility with older test/integration hooks
+                remaining = remaining_daily_send_budget(db)
         if remaining == 0:
             print(json.dumps(totals))
             return

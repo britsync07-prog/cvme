@@ -57,12 +57,12 @@ if settings.environment == "production":
         raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD are required in production.")
     if settings.app_secret == "development-only-change-me" or len(settings.app_secret) < 32:
         raise RuntimeError("APP_SECRET must be a unique value of at least 32 characters in production.")
-    if not settings.encryption_key:
-        raise RuntimeError("ENCRYPTION_KEY is required in production.")
     if "*" in {host.strip() for host in settings.allowed_hosts.split(",")}:
         raise RuntimeError("ALLOWED_HOSTS cannot contain '*' in production.")
     if settings.database_url.startswith("sqlite"):
         raise RuntimeError("DATABASE_URL must use PostgreSQL in production.")
+    if not settings.encryption_key:
+        raise RuntimeError("ENCRYPTION_KEY is required in production.")
 
 
 def update_settings(**kwargs) -> None:

@@ -925,6 +925,7 @@ def dashboard(request: Request, tab: str = "applications"):
         except ValueError:
             daily_remaining = 0
         subscription_status = status_for(db, workspace)
+        announcement = setting_value(db, "announcement", "")
         notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(20)).all()
         blocklist = db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id, Suppression.reason == "workspace_blocklist").order_by(Suppression.created_at.desc())).all()
         jobs = db.scalars(select(OutreachJob).where(OutreachJob.workspace_id == workspace.id).order_by(OutreachJob.created_at.desc()).limit(10)).all()
@@ -949,6 +950,7 @@ def dashboard(request: Request, tab: str = "applications"):
                 "ai_config": ai_config,
                 "blocklist": blocklist,
                 "jobs": jobs,
+                "announcement": announcement,
             },
         )
 
@@ -1016,6 +1018,7 @@ def admin_dashboard(request: Request):
                 "kill_switch": kill_switch_enabled(),
                 "plans": db.scalars(select(Plan).where(Plan.active.is_(True)).order_by(Plan.id)).all(),
                 "settings": settings,
+                "announcement": setting_value(db, "announcement", ""),
             },
         )
 
@@ -1408,13 +1411,14 @@ def admin_kill_switch(request: Request, enabled: bool = Form()):
 
 
 @app.post("/admin/system/settings")
-def admin_system_settings(request: Request, signup_enabled: bool = Form(False), maintenance_mode: bool = Form(False), companies_house_api_key: str = Form(""), default_daily_limit: int = Form(100)):
+def admin_system_settings(request: Request, signup_enabled: bool = Form(False), maintenance_mode: bool = Form(False), companies_house_api_key: str = Form(""), default_daily_limit: int = Form(100), announcement: str = Form("")):
     with SessionLocal() as db:
         actor = _require_admin(request, db)
         update_settings(signup_enabled=signup_enabled, maintenance_mode=maintenance_mode)
         set_setting(db, "signup_enabled", "true" if signup_enabled else "false")
         set_setting(db, "maintenance_mode", "true" if maintenance_mode else "false")
         set_setting(db, "default_daily_limit", str(min(max(default_daily_limit, 1), 100)))
+        set_setting(db, "announcement", announcement.strip()[:2000])
         if companies_house_api_key.strip():
             set_setting(db, "companies_house_api_key", companies_house_api_key.strip())
             settings.companies_house_api_key = companies_house_api_key.strip()
@@ -1774,7 +1778,12 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
                 raise HTTPException(404, "Workspace not found")
         else:
             workspace, user = ensure_default_workspace(db)
-        require_send_slot(db, workspace)
+        try:
+            require_send_slot(db, workspace)
+        except HTTPException as exc:
+            db.add(Notification(workspace_id=workspace.id, user_id=user.id, kind="limit_reached", message=str(exc.detail)))
+            db.commit()
+            raise
         recipient = campaign_recipient = db.scalar(select(Campaign.recipient_email).where(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id))
         recipient_domain = recipient.rsplit("@", 1)[-1].lower() if recipient and "@" in recipient else ""
         if not corporate_recipient(recipient or ""):
@@ -1822,8 +1831,10 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
             db.commit()
         except Exception as exc:
             campaign.status = "send_uncertain"
-            if sender_account and ("401" in str(exc) or "403" in str(exc) or "authentication" in str(exc).lower() or "login" in str(exc).lower()):
+            sender_auth_failed = sender_account and ("401" in str(exc) or "403" in str(exc) or "authentication" in str(exc).lower() or "login" in str(exc).lower())
+            if sender_auth_failed:
                 sender_account.status = "reauth_required" if sender_account.provider == "gmail" else "paused"
+                db.add(Notification(workspace_id=workspace.id, user_id=user.id, kind="gmail_disconnected", message="Your workspace sender needs re-authentication before another email can be sent."))
             audit(db, campaign, "send_uncertain", str(exc))
             db.add(Notification(workspace_id=workspace.id, user_id=user.id, kind="send_error", message=f"Delivery failed for {campaign.recipient_email}."))
             db.commit()
@@ -2002,6 +2013,7 @@ def disconnect_email_account(request: Request):
         account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status != "disconnected").order_by(EmailAccount.id))
         if account:
             account.status = "disconnected"
+            db.add(Notification(workspace_id=workspace.id, user_id=workspace.owner_user_id, kind="gmail_disconnected", message="The workspace email sender was disconnected."))
             db.commit()
     return RedirectResponse("/?tab=settings", status_code=303)
 

@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     database_url: str = "sqlite:///./data/tailormail.db"
     app_secret: str = "development-only-change-me"
+    encryption_key: str = ""
     environment: str = "development"
     admin_username: str = ""
     admin_password: str = ""
@@ -44,6 +45,8 @@ if settings.environment == "production":
         raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD are required in production.")
     if settings.app_secret == "development-only-change-me" or len(settings.app_secret) < 32:
         raise RuntimeError("APP_SECRET must be a unique value of at least 32 characters in production.")
+    if not settings.encryption_key:
+        raise RuntimeError("ENCRYPTION_KEY is required in production.")
     if "*" in {host.strip() for host in settings.allowed_hosts.split(",")}:
         raise RuntimeError("ALLOWED_HOSTS cannot contain '*' in production.")
     if settings.database_url.startswith("sqlite"):

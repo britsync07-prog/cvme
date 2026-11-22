@@ -19,8 +19,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
-from .models import AuditEvent, Campaign, Candidate, Plan, Subscription, User, Workspace, WorkspaceMembership
-from .security import hash_password, utc_now, verify_password
+from .models import AIProviderConfig, AuditEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, User, Workspace, WorkspaceMembership
+from .security import encrypt_secret, hash_password, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
     candidates_from_zip,
@@ -513,6 +513,7 @@ def prepare_campaign(campaign_id: int, request: Request = None):
                 campaign.company_name,
                 target_role=campaign.target_role,
                 job_description=campaign.job_description,
+                ai_config=db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id)),
             )
 
             campaign.tailored_yaml = result["cv_yaml"]
@@ -604,6 +605,7 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
                 campaign.email_subject,
                 campaign.email_body,
                 Path(campaign.artifact_path),
+                email_account=db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id)),
             )
             campaign.status = "sent"
             campaign.sent_at = datetime.now(timezone.utc)
@@ -635,6 +637,7 @@ def delete_campaign(request: Request, campaign_id: int):
 
 @app.post("/settings")
 def save_settings(
+    request: Request,
     base_url: str = Form(""),
     api_key: str = Form(""),
     llm_model: str = Form(""),
@@ -658,6 +661,18 @@ def save_settings(
     outreach_auto_send: bool = Form(False),
     outreach_timezone: str = Form("Asia/Dhaka"),
 ):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        if api_key.strip():
+            config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
+            if not config:
+                config = AIProviderConfig(workspace_id=workspace.id, provider="custom", base_url=base_url.strip() or settings.base_url, encrypted_api_key=encrypt_secret(api_key.strip()), model_name=llm_model.strip() or settings.llm_model)
+                db.add(config)
+            else:
+                config.base_url = base_url.strip() or config.base_url
+                config.encrypted_api_key = encrypt_secret(api_key.strip())
+                config.model_name = llm_model.strip() or config.model_name
+            db.commit()
     update_settings(
         base_url=base_url.strip() or settings.base_url,
         api_key=api_key.strip() or settings.api_key,
@@ -711,3 +726,31 @@ def api_test_smtp(
         smtp_use_tls,
     )
     return JSONResponse(result)
+
+
+@app.post("/settings/email-account")
+def save_email_account(
+    request: Request,
+    email: str = Form(),
+    host: str = Form(),
+    port: int = Form(587),
+    username: str = Form(""),
+    password: str = Form(""),
+    use_tls: bool = Form(True),
+):
+    if not settings.encryption_key:
+        raise HTTPException(503, "ENCRYPTION_KEY is not configured.")
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id).order_by(EmailAccount.id))
+        payload = json.dumps({"host": host.strip(), "port": port, "username": username.strip(), "password": password, "use_tls": use_tls})
+        if not account:
+            account = EmailAccount(workspace_id=workspace.id, provider="smtp", email=email.strip(), encrypted_credentials=encrypt_secret(payload))
+            db.add(account)
+        else:
+            account.email = email.strip()
+            account.provider = "smtp"
+            account.encrypted_credentials = encrypt_secret(payload)
+            account.status = "active"
+        db.commit()
+    return RedirectResponse("/?tab=settings", status_code=303)

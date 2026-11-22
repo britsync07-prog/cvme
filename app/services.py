@@ -18,6 +18,7 @@ import httpx
 import yaml
 
 from .config import settings
+from .security import decrypt_secret
 
 
 LLM_TIMEOUT_SECONDS = 300
@@ -373,8 +374,16 @@ def tailor(
     company_name: str,
     target_role: str | None = None,
     job_description: str | None = None,
+    ai_config=None,
 ) -> dict:
-    if not settings.api_key:
+    base_url = settings.base_url
+    api_key = settings.api_key
+    llm_model = settings.llm_model
+    if ai_config is not None:
+        base_url = ai_config.base_url or base_url
+        api_key = decrypt_secret(ai_config.encrypted_api_key)
+        llm_model = ai_config.model_name or llm_model
+    if not api_key:
         raise RuntimeError("API_KEY is not configured.")
     try:
         parsed_source = yaml.safe_load(candidate_yaml)
@@ -410,12 +419,12 @@ Research Insights:
 Original RenderCV YAML:
 {candidate_yaml}"""
 
-    url = _llm_url(settings.base_url, "chat/completions")
-    headers = {"Authorization": f"Bearer {settings.api_key}"}
+    url = _llm_url(base_url, "chat/completions")
+    headers = {"Authorization": f"Bearer {api_key}"}
 
     # First attempt with json_object format; fallback to standard if model does not support it
     payload = {
-        "model": settings.llm_model,
+        "model": llm_model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.15,
         "response_format": {"type": "json_object"},
@@ -518,8 +527,26 @@ def render_pdf(cv_yaml: str, campaign_id: int) -> Path:
     return pdf_path
 
 
-def send_email(recipient: str, subject: str, body: str, attachment: Path) -> str | None:
+def send_email(recipient: str, subject: str, body: str, attachment: Path, email_account=None) -> str | None:
+    sender_host = settings.smtp_host
+    sender_port = settings.smtp_port
+    sender_username = settings.smtp_username
+    sender_password = settings.smtp_password
+    sender_from = settings.smtp_from
+    sender_tls = settings.smtp_use_tls
+    if email_account is not None:
+        if email_account.provider != "smtp":
+            raise RuntimeError("This email account provider is not enabled yet.")
+        credentials = json.loads(decrypt_secret(email_account.encrypted_credentials))
+        sender_host = credentials["host"]
+        sender_port = int(credentials.get("port", 587))
+        sender_username = credentials.get("username", "")
+        sender_password = credentials.get("password", "")
+        sender_from = email_account.email
+        sender_tls = bool(credentials.get("use_tls", True))
     if settings.resend_api_key:
+        if email_account is not None:
+            raise RuntimeError("Resend is a platform sender; disconnect the workspace sender first.")
         if not settings.resend_from:
             raise RuntimeError("RESEND_FROM is required when using Resend.")
         response = httpx.post(
@@ -537,10 +564,10 @@ def send_email(recipient: str, subject: str, body: str, attachment: Path) -> str
         response.raise_for_status()
         payload = response.json()
         return payload.get("id") if isinstance(payload, dict) and isinstance(payload.get("id"), str) else None
-    if not all([settings.smtp_host, settings.smtp_from]):
+    if not all([sender_host, sender_from]):
         raise RuntimeError("SMTP is not configured. Email was not sent.")
     message = EmailMessage()
-    message["From"] = settings.smtp_from
+    message["From"] = sender_from
     message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
@@ -550,11 +577,11 @@ def send_email(recipient: str, subject: str, body: str, attachment: Path) -> str
         subtype="pdf",
         filename=attachment.name,
     )
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as client:
-        if settings.smtp_use_tls:
+    with smtplib.SMTP(sender_host, sender_port, timeout=30) as client:
+        if sender_tls:
             client.starttls()
-        if settings.smtp_username:
-            client.login(settings.smtp_username, settings.smtp_password)
+        if sender_username:
+            client.login(sender_username, sender_password)
         client.send_message(message)
     return None
 

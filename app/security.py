@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from cryptography.fernet import Fernet, InvalidToken
+
+from .config import settings
 
 PASSWORDS = PasswordHasher()
 
@@ -38,3 +41,20 @@ def utc_now() -> datetime:
 
 def safe_equal(left: str, right: str) -> bool:
     return hmac.compare_digest(left, right)
+
+
+def _fernet() -> Fernet:
+    if not settings.encryption_key:
+        raise RuntimeError("ENCRYPTION_KEY is required before storing tenant secrets.")
+    return Fernet(settings.encryption_key.encode("ascii"))
+
+
+def encrypt_secret(value: str) -> str:
+    return _fernet().encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(value: str) -> str:
+    try:
+        return _fernet().decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Stored tenant secret cannot be decrypted.") from exc

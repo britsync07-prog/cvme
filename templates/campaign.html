@@ -81,7 +81,15 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button type="submit" class="button primary large">Research and tailor CV</button>
       </form>
+      <form action="/campaigns/{{ campaign.id }}/prepare/queue" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <button type="submit" class="button secondary large">Queue in background</button>
+      </form>
     </div>
+    {% endif %}
+
+    {% if campaign.status in ['queued', 'researching'] %}
+    <div class="panel trial-banner"><strong>Tailoring in progress.</strong> Research, AI validation, and RenderCV compilation are running in the background. Refresh this page for progress.</div>
     {% endif %}
 
     {% if campaign.status in ['ready', 'sent', 'send_uncertain'] %}

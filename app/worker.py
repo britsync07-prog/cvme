@@ -32,6 +32,11 @@ def run() -> None:
             if job.get("type") == "daily_outreach":
                 from .daily_outreach import main
                 main(job.get("workspace_id"), job_id=job_id)
+            elif job.get("type") == "prepare_campaign":
+                from .main import prepare_campaign
+                prepare_campaign(int(job["campaign_id"]), workspace_id=int(job["workspace_id"]))
+                if job_id:
+                    mark_job(int(job_id), "succeeded", progress=100)
             elif job.get("type") == "trial_reminder":
                 from .services import send_system_email
                 days_left = job.get("days_left", 0)

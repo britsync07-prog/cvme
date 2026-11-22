@@ -22,6 +22,7 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
     configured_role = settings.outreach_target_role
     configured_limit = settings.outreach_daily_limit
     configured_timezone = settings.outreach_timezone
+    workspace_auto_send = settings.outreach_auto_send
     with SessionLocal() as db:
         workspace = None
         if workspace_id:
@@ -34,6 +35,7 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
             configured_role = workspace.outreach_target_role or configured_role
             configured_limit = workspace.daily_limit or configured_limit
             configured_timezone = workspace.timezone or configured_timezone
+            workspace_auto_send = bool(getattr(workspace, "outreach_auto_send", workspace_auto_send))
             if workspace.paused:
                 errors.append("Workspace outreach is paused.")
         elif workspace_id:
@@ -48,7 +50,7 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
         errors.append("COMPANIES_HOUSE_API_KEY is required.")
     if not settings.api_key or not settings.base_url or not settings.llm_model:
         errors.append("BASE_URL, API_KEY, and LLM_MODEL are required.")
-    if settings.outreach_auto_send:
+    if workspace_auto_send:
         with SessionLocal() as db:
             sender = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == (workspace_id or (ensure_default_workspace(db)[0].id)), EmailAccount.status == "active"))
         if not sender and not (settings.resend_api_key and settings.resend_from):
@@ -107,7 +109,7 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
             candidate_id = workspace.outreach_candidate_id if workspace_id else settings.outreach_candidate_id
             query = workspace.outreach_query if workspace_id else settings.outreach_query
             target_role = workspace.outreach_target_role if workspace_id else settings.outreach_target_role
-            auto_send = settings.outreach_auto_send
+            auto_send = bool(getattr(workspace, "outreach_auto_send", settings.outreach_auto_send))
         response = discover_lead_batch(
             candidate_id=candidate_id,
             query=query,
@@ -121,7 +123,7 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
             totals[key] += result[key]
         if job_id:
             mark_job(job_id, "running", progress=min(95, 5 + totals["discovered"]))
-        if not settings.outreach_auto_send:
+        if not auto_send:
             print(json.dumps(totals))
             if result["completed"] < remaining:
                 if job_id:
@@ -134,7 +136,7 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
             return
         if result["discovered"] == 0:
             print(json.dumps(totals))
-            action = "send" if settings.outreach_auto_send else "preparation"
+            action = "send" if auto_send else "preparation"
             if job_id:
                 mark_job(job_id, "failed", progress=100, error=f"Daily {action} target missed.")
             raise SystemExit(f"Daily {action} target missed: {remaining} slots remain; no new verified leads were available.")

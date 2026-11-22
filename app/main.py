@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -62,6 +62,13 @@ async def lifespan(app: FastAPI):
             settings.signup_enabled = setting_value(db, "signup_enabled").lower() == "true"
         if setting_value(db, "maintenance_mode", ""):
             settings.maintenance_mode = setting_value(db, "maintenance_mode").lower() == "true"
+        if setting_value(db, "companies_house_api_key", ""):
+            settings.companies_house_api_key = setting_value(db, "companies_house_api_key")
+        if setting_value(db, "default_daily_limit", ""):
+            try:
+                settings.outreach_daily_limit = min(max(int(setting_value(db, "default_daily_limit")), 1), 100)
+            except ValueError:
+                pass
     yield
 
 
@@ -101,7 +108,7 @@ def rate_limited(request: Request, bucket: str, limit: int, window: int = 900) -
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        public_paths = {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
+        public_paths = {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/cookies", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
         if settings.maintenance_mode and request.url.path not in public_paths and not request.url.path.startswith("/static/") and not request.session.get("authenticated"):
             return PlainTextResponse("TailorMail is temporarily under maintenance.", status_code=503)
         if (
@@ -273,6 +280,7 @@ def _legal_page(request: Request, page_name: str):
         "acceptable-use": ("Acceptable use", "Do not use TailorMail for spam, unlawful profiling, harassment, or deceptive outreach."),
         "refunds": ("Refund policy", "Subscription refunds are handled according to the plan and billing terms shown at checkout."),
         "contact": ("Contact", "Contact support through your workspace support channel."),
+        "cookies": ("Cookie notice", "TailorMail uses an HttpOnly session cookie to keep you signed in and essential security state for CSRF and OAuth. We do not use advertising cookies."),
     }
     title, body = pages[page_name]
     return templates.TemplateResponse(request, "legal.html", {"title": title, "body": body})
@@ -303,15 +311,21 @@ def contact_page(request: Request):
     return _legal_page(request, "contact")
 
 
+@app.get("/cookies")
+def cookies_page(request: Request):
+    return _legal_page(request, "cookies")
+
+
 @app.get("/robots.txt", include_in_schema=False)
 def robots():
-    return PlainTextResponse("User-agent: *\nDisallow: /\nAllow: /landing\nAllow: /pricing\nAllow: /terms\nAllow: /privacy\nAllow: /acceptable-use\nAllow: /refunds\nAllow: /contact\n")
+    return PlainTextResponse("User-agent: *\nDisallow: /\nAllow: /landing\nAllow: /pricing\nAllow: /terms\nAllow: /privacy\nAllow: /acceptable-use\nAllow: /refunds\nAllow: /contact\nAllow: /cookies\nSitemap: /sitemap.xml\n")
 
 
 @app.get("/sitemap.xml", include_in_schema=False)
 def sitemap(request: Request):
     base = str(request.base_url).rstrip("/")
-    return PlainTextResponse("\n".join(f"{base}/{path}" for path in ("landing", "pricing", "terms", "privacy", "acceptable-use", "refunds", "contact")), media_type="application/xml")
+    paths = ("landing", "pricing", "terms", "privacy", "acceptable-use", "refunds", "contact", "cookies")
+    return PlainTextResponse("<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">" + "".join(f"<url><loc>{base}/{path}</loc></url>" for path in paths) + "</urlset>", media_type="application/xml")
 
 
 @app.post("/signup")
@@ -572,6 +586,11 @@ async def billing_webhook(request: Request):
         if db.scalar(select(BillingEvent).where(BillingEvent.provider_event_id == event_id)):
             return {"ok": True, "duplicate": True}
         db.add(BillingEvent(provider_event_id=event_id, event_type=event_type, payload=event))
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            return {"ok": True, "duplicate": True}
         data = event.get("data", {}).get("object", {})
         workspace_id = data.get("metadata", {}).get("workspace_id")
         provider_subscription_id = data.get("subscription") if event_type.startswith("invoice.") else data.get("id")
@@ -593,9 +612,9 @@ async def billing_webhook(request: Request):
             elif event_type == "invoice.paid":
                 subscription.status = "active"
             if event_type.startswith("invoice.") and subscription:
-                db.merge(Invoice(workspace_id=subscription.workspace_id, provider_invoice_id=data.get("id"), status=data.get("status", event_type.removeprefix("invoice.")), amount_cents=int(data.get("amount_paid") or data.get("amount_due") or 0), currency=data.get("currency", "gbp")))
+                invoice = db.merge(Invoice(workspace_id=subscription.workspace_id, provider_invoice_id=data.get("id"), status=data.get("status", event_type.removeprefix("invoice.")), amount_cents=int(data.get("amount_paid") or data.get("amount_due") or 0), currency=data.get("currency", "gbp")))
+                db.flush()
                 if event_type == "invoice.paid":
-                    invoice = db.scalar(select(Invoice).where(Invoice.provider_invoice_id == data.get("id")))
                     payment_id = data.get("payment_intent") or data.get("charge")
                     if payment_id and not db.scalar(select(Payment).where(Payment.provider_payment_id == payment_id)):
                         db.add(Payment(workspace_id=subscription.workspace_id, invoice_id=invoice.id if invoice else None, provider_payment_id=payment_id, status="succeeded", amount_cents=int(data.get("amount_paid") or 0), currency=data.get("currency", "gbp")))
@@ -744,6 +763,7 @@ def delete_account(request: Request):
                 db.delete(token)
         db.delete(workspace)
         user.is_active = False
+        user.deleted_at = utc_now()
         user.email = f"deleted-{user.id}@invalid.local"
         user.password_hash = None
         user.google_sub = None
@@ -987,6 +1007,7 @@ def admin_dashboard(request: Request):
                 "audit_count": db.scalar(select(func.count(AuditLog.id))) or 0,
                 "kill_switch": kill_switch_enabled(),
                 "plans": db.scalars(select(Plan).where(Plan.active.is_(True)).order_by(Plan.id)).all(),
+                "settings": settings,
             },
         )
 
@@ -1144,6 +1165,7 @@ def admin_delete_user(request: Request, user_id: int):
                 workspace.deleted_at = utc_now()
                 workspace.paused = True
         target.is_active = False
+        target.deleted_at = utc_now()
         target.email = f"deleted-{target.id}@invalid.local"
         target.password_hash = None
         target.google_sub = None
@@ -1375,12 +1397,17 @@ def admin_kill_switch(request: Request, enabled: bool = Form()):
 
 
 @app.post("/admin/system/settings")
-def admin_system_settings(request: Request, signup_enabled: bool = Form(True), maintenance_mode: bool = Form(False)):
+def admin_system_settings(request: Request, signup_enabled: bool = Form(False), maintenance_mode: bool = Form(False), companies_house_api_key: str = Form(""), default_daily_limit: int = Form(100)):
     with SessionLocal() as db:
         actor = _require_admin(request, db)
         update_settings(signup_enabled=signup_enabled, maintenance_mode=maintenance_mode)
         set_setting(db, "signup_enabled", "true" if signup_enabled else "false")
         set_setting(db, "maintenance_mode", "true" if maintenance_mode else "false")
+        set_setting(db, "default_daily_limit", str(min(max(default_daily_limit, 1), 100)))
+        if companies_house_api_key.strip():
+            set_setting(db, "companies_house_api_key", companies_house_api_key.strip())
+            settings.companies_house_api_key = companies_house_api_key.strip()
+        settings.outreach_daily_limit = min(max(default_daily_limit, 1), 100)
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="system_settings_changed", entity_type="system", detail={"signup_enabled": signup_enabled, "maintenance_mode": maintenance_mode}, ip_address=request.client.host if request.client else None))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
@@ -1636,6 +1663,23 @@ def prepare_campaign(campaign_id: int, request: Request = None, workspace_id: in
     return RedirectResponse(f"/campaigns/{campaign_id}", status_code=303)
 
 
+@app.post("/campaigns/{campaign_id}/prepare/queue")
+def queue_prepare_campaign(campaign_id: int, request: Request):
+    """Queue research, AI tailoring, and RenderCV compilation outside the web request."""
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        require_feature(db, workspace, "ai_tailoring")
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
+        if campaign.status not in {"draft", "failed"}:
+            raise HTTPException(400, "Only draft or failed campaigns can be queued.")
+        campaign.status = "queued"
+        db.commit()
+        job_id = enqueue_job("prepare_campaign", {"campaign_id": campaign.id}, workspace.id, user.id)
+        audit(db, campaign, "queued", f"Research and tailoring queued as job {job_id}.", user.id)
+        db.commit()
+    return RedirectResponse(f"/campaigns/{campaign_id}", status_code=303)
+
+
 @app.post("/campaigns/{campaign_id}/update-email")
 def update_campaign_email(
     request: Request,
@@ -1802,6 +1846,8 @@ def save_settings(
         workspace.timezone = outreach_timezone.strip() or workspace.timezone
         workspace.schedule_time = outreach_schedule_time.strip()
         workspace.daily_limit = min(max(outreach_daily_limit, 1), 100)
+        workspace.outreach_policy = "review_required"
+        workspace.outreach_auto_send = bool(outreach_auto_send)
         workspace.outreach_candidate_id = max(outreach_candidate_id, 0) or None
         workspace.outreach_query = outreach_query.strip()
         workspace.outreach_target_role = outreach_target_role.strip()
@@ -1834,7 +1880,7 @@ def save_settings(
         scrapollo_cookie_file=scrapollo_cookie_file.strip() or settings.scrapollo_cookie_file,
         scrapollo_input_file=scrapollo_input_file.strip() or settings.scrapollo_input_file,
         outreach_daily_limit=min(max(outreach_daily_limit, 1), 100),
-        outreach_policy=outreach_policy if outreach_policy == "review_required" else "review_required",
+        outreach_policy="review_required",
         outreach_candidate_id=max(outreach_candidate_id, 0),
         outreach_query=outreach_query.strip(),
         outreach_target_role=outreach_target_role.strip(),

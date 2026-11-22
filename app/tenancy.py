@@ -66,7 +66,7 @@ def current_workspace(request: Request, db) -> tuple[Workspace, User]:
     if workspace_id and user_id:
         workspace = db.get(Workspace, workspace_id)
         user = db.get(User, user_id)
-        if workspace and user and not workspace.deleted_at and user.is_active:
+        if workspace and user and not workspace.deleted_at and user.is_active and not user.deleted_at:
             membership = db.scalar(
                 select(WorkspaceMembership).where(
                     WorkspaceMembership.workspace_id == workspace.id,

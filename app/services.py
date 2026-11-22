@@ -618,6 +618,19 @@ def test_llm_connection(base_url: str, api_key: str, model: str) -> dict:
         return {"ok": False, "message": f"Connection failed to {url}: {exc}"}
 
 
+def send_system_email(recipient: str, subject: str, body: str) -> None:
+    """Send a transactional system email through the platform sender only."""
+    if not settings.resend_api_key or not settings.resend_from:
+        return
+    response = httpx.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+        json={"from": settings.resend_from, "to": [recipient], "subject": subject, "text": body},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
 def test_smtp_connection(
     host: str, port: int, username: str, password: str, use_tls: bool
 ) -> dict:

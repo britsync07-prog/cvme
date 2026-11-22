@@ -150,6 +150,7 @@
 
       {% if candidates %}
       <form action="/campaigns" method="post" class="standard-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <div class="form-row">
           <label class="field">
             <span>Candidate Profile <strong class="req">*</strong></span>
@@ -220,6 +221,7 @@
       </div>
       {% if candidates %}
       <form action="/leads/discover" method="post" class="standard-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <div class="form-row">
           <label class="field"><span>Candidate</span><select name="candidate_id" required>{% for c in candidates %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></label>
           <label class="field"><span>Companies House search</span><input name="query" placeholder="e.g. software, consulting, engineering" required></label>
@@ -229,6 +231,7 @@
       </form>
 
       <form action="/leads/batch" method="post" class="standard-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <h2>Prepare a daily batch</h2>
           <p class="subtitle">Creates up to 100 new company campaigns from Companies House queries. Separate alternative searches with semicolons; existing company names and numbers are skipped.</p>
         <div class="form-row">
@@ -259,6 +262,7 @@
         </div>
 
         <form action="/candidates" method="post" class="standard-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
           <label class="field">
             <span>Candidate Full Name <strong class="req">*</strong></span>
             <input name="name" placeholder="e.g. Alex Johnson" required>
@@ -286,6 +290,7 @@
           <h3>📦 Bulk Import (ZIP of YAML files)</h3>
           <p>Upload a ZIP file containing up to 500 RenderCV <code>.yaml</code> or <code>.yml</code> files. Each file must define <code>cv.name</code> and <code>cv.email</code>.</p>
           <form action="/candidates/import" method="post" enctype="multipart/form-data" class="standard-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
             <label class="field">
               <span>Select ZIP Archive</span>
               <input type="file" name="archive" accept=".zip" required>
@@ -325,6 +330,7 @@
                 <pre class="yaml-peek">{{ c.cv_yaml }}</pre>
               </details>
               <form action="/candidates/{{ c.id }}/delete" method="post" onsubmit="return confirm('Delete this candidate and all their applications?');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
                 <button type="submit" class="button small danger">Delete</button>
               </form>
             </div>
@@ -349,6 +355,7 @@
       </div>
 
       <form action="/settings" method="post" class="standard-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <div class="settings-section">
           <h3>🤖 LLM Intelligence Engine</h3>
           <p class="subtitle">Connects to your local or hosted OpenAI-compatible endpoint for truthful CV adaptation.</p>

@@ -23,8 +23,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, Suppression, User, Workspace, WorkspaceMembership
-from .security import encrypt_secret, hash_password, utc_now, verify_password
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, PasswordResetToken, Plan, Subscription, Suppression, User, Workspace, WorkspaceMembership
+from .security import encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
     candidates_from_zip,
@@ -34,6 +34,7 @@ from .services import (
     render_pdf,
     research_company,
     send_email,
+    send_system_email,
     tailor,
     test_llm_connection,
     test_smtp_connection,
@@ -59,11 +60,22 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 
+def csrf_token(request: Request) -> str:
+    token = request.session.get("csrf_token")
+    if not token:
+        token = new_token()
+        request.session["csrf_token"] = token
+    return token
+
+
+templates.env.globals["csrf_token"] = csrf_token
+
+
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if (
             settings.admin_username
-            and request.url.path not in {"/healthz", "/login", "/signup", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe"}
+            and request.url.path not in {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe"}
             and not request.url.path.startswith("/static/")
             and not request.session.get("authenticated")
         ):
@@ -87,7 +99,22 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class CSRFMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/healthz", "/billing/webhook", "/unsubscribe"}:
+            body = await request.body()
+            token = request.session.get("csrf_token")
+            supplied = re.search(rb"(?:^|&)csrf_token=([^&]+)", body) or re.search(rb'name="csrf_token"\r?\n\r?\n([^\r\n]+)', body)
+            if not token or not supplied or not secrets.compare_digest(supplied.group(1).decode("utf-8", "ignore"), token):
+                return JSONResponse({"detail": "CSRF validation failed."}, status_code=403)
+            async def receive():
+                return {"type": "http.request", "body": body, "more_body": False}
+            request._receive = receive
+        return await call_next(request)
+
+
 app.add_middleware(SecurityMiddleware)
+app.add_middleware(CSRFMiddleware)
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.app_secret,
@@ -203,7 +230,65 @@ def signup(
         db.commit()
         request.session.clear()
         request.session.update({"authenticated": True, "user_id": user.id, "workspace_id": workspace.id})
+        verification = new_token()
+        db.add(EmailVerificationToken(user_id=user.id, token_hash=token_hash(verification), expires_at=utc_now() + timedelta(hours=24)))
+        db.commit()
+        send_system_email(email, "Verify your TailorMail account", f"Verify your account: {settings.base_url}/verify-email?token={verification}")
     return RedirectResponse("/", status_code=303)
+
+
+@app.get("/verify-email")
+def verify_email(request: Request, token: str = ""):
+    with SessionLocal() as db:
+        record = db.scalar(select(EmailVerificationToken).where(EmailVerificationToken.token_hash == token_hash(token), EmailVerificationToken.used_at.is_(None), EmailVerificationToken.expires_at > utc_now())) if token else None
+        if not record:
+            return templates.TemplateResponse(request, "auth_message.html", {"title": "Verification failed", "message": "This verification link is invalid or expired."}, status_code=400)
+        user = db.get(User, record.user_id)
+        user.email_verified_at = utc_now()
+        record.used_at = utc_now()
+        db.commit()
+    return templates.TemplateResponse(request, "auth_message.html", {"title": "Email verified", "message": "Your email is verified. You can now sign in."})
+
+
+@app.get("/forgot-password")
+def forgot_password_page(request: Request):
+    return templates.TemplateResponse(request, "forgot_password.html", {"message": ""})
+
+
+@app.post("/forgot-password")
+def forgot_password(request: Request, email: str = Form()):
+    normalized = email.strip().lower()
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.email == normalized, User.is_active.is_(True)))
+        if user:
+            raw = new_token()
+            db.add(PasswordResetToken(user_id=user.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=1)))
+            db.commit()
+            send_system_email(user.email, "Reset your TailorMail password", f"Reset your password: {settings.base_url}/reset-password?token={raw}")
+    return templates.TemplateResponse(request, "forgot_password.html", {"message": "If that email exists, a reset link has been sent."})
+
+
+@app.get("/reset-password")
+def reset_password_page(request: Request, token: str = ""):
+    return templates.TemplateResponse(request, "reset_password.html", {"token": token, "error": ""})
+
+
+@app.post("/reset-password")
+def reset_password(request: Request, token: str = Form(), password: str = Form()):
+    with SessionLocal() as db:
+        record = db.scalar(select(PasswordResetToken).where(PasswordResetToken.token_hash == token_hash(token), PasswordResetToken.used_at.is_(None), PasswordResetToken.expires_at > utc_now()))
+        if not record:
+            return templates.TemplateResponse(request, "reset_password.html", {"token": token, "error": "This reset link is invalid or expired."}, status_code=400)
+        try:
+            user = db.get(User, record.user_id)
+            user.password_hash = hash_password(password)
+        except ValueError as exc:
+            return templates.TemplateResponse(request, "reset_password.html", {"token": token, "error": str(exc)}, status_code=400)
+        user.failed_login_count = 0
+        user.locked_until = None
+        record.used_at = utc_now()
+        db.commit()
+    return RedirectResponse("/login", status_code=303)
 
 
 @app.post("/login")
@@ -211,7 +296,10 @@ def login(request: Request, username: str = Form(), password: str = Form(), next
     email = username.strip().lower()
     with SessionLocal() as db:
         user = db.scalar(select(User).where(User.email == email))
-        if user and user.password_hash and user.is_active and not user.locked_until and verify_password(user.password_hash, password):
+        if user and user.locked_until and user.locked_until <= utc_now():
+            user.locked_until = None
+            user.failed_login_count = 0
+        if user and user.password_hash and user.is_active and (not user.locked_until or user.locked_until <= utc_now()) and verify_password(user.password_hash, password):
             user.failed_login_count = 0
             user.last_login_at = utc_now()
             membership = db.scalar(select(WorkspaceMembership).where(WorkspaceMembership.user_id == user.id).order_by(WorkspaceMembership.created_at))

@@ -78,6 +78,7 @@
         </ol>
       </div>
       <form action="/campaigns/{{ campaign.id }}/prepare" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button type="submit" class="button primary large">Research and tailor CV</button>
       </form>
     </div>
@@ -132,6 +133,7 @@
         {% if campaign.status == 'ready' %}
         <!-- EDITABLE EMAIL FORM -->
         <form action="/campaigns/{{ campaign.id }}/update-email" method="post" class="standard-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
           <div class="email-meta-header">
             <span class="meta-tag"><strong>To:</strong> <code>{{ campaign.recipient_email }}</code></span>
             <span class="meta-tag"><strong>Attachment:</strong> {{ campaign.candidate.name }}-{{ campaign.company_name }}-CV.pdf</span>
@@ -162,6 +164,7 @@
           <p>Please review the PDF and email carefully. Clicking send delivers one email with the tailored PDF attached directly to <code>{{ campaign.recipient_email }}</code>.</p>
           
           <form action="/campaigns/{{ campaign.id }}/send" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
             <label class="checkbox-label send-check">
               <input type="checkbox" name="approved" value="true" required>
               <span><strong>I explicitly approve sending this tailored application.</strong> (Irreversible; protected against duplicate sending).</span>
@@ -211,6 +214,7 @@
 
     <div class="campaign-footer">
       <form action="/campaigns/{{ campaign.id }}/delete" method="post" onsubmit="return confirm('Delete this application record?');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
         <button type="submit" class="button ghost danger">Delete Application</button>
       </form>
     </div>

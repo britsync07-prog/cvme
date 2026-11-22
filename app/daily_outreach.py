@@ -54,7 +54,7 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
     if workspace_auto_send:
         with SessionLocal() as db:
             sender = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == (workspace_id or (ensure_default_workspace(db)[0].id)), EmailAccount.status == "active"))
-        if not sender:
+        if not sender and (workspace_id or not (settings.resend_api_key and settings.resend_from)):
             errors.append("Configured automatic sending requires Resend or SMTP / a connected workspace sender.")
     try:
         ZoneInfo(configured_timezone)

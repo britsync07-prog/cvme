@@ -658,6 +658,32 @@ def test_llm_request_retries_transport_errors():
     assert calls == 3
 
 
+def test_tailor_retries_malformed_json_until_valid_response(monkeypatch):
+    source = "cv:\n  name: Test Person\n  email: test@example.com\n  headline: Original\n  sections: {}\n"
+    valid = {
+        "cv_yaml": source.replace("Original", "Platform Engineer"),
+        "email_subject": "Application to Acme Corp",
+        "email_body": "Dear Acme Corp, my CV is attached.",
+    }
+    calls = 0
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            nonlocal calls
+            calls += 1
+            content = "not json" if calls < 3 else json.dumps(valid)
+            return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(services.settings, "api_key", "test-key")
+    monkeypatch.setattr(services.httpx, "post", lambda *args, **kwargs: Response())
+    result = services.tailor(source, {"sources": []}, "Acme Corp")
+    assert calls == 3
+    assert "Platform Engineer" in result["cv_yaml"]
+
+
 def test_render_pdf_with_rendercv(tmp_path, monkeypatch):
     """Verifies that the installed RenderCV v2.8 compiler creates a real PDF from YAML."""
     monkeypatch.setattr(services.settings, "artifact_dir", tmp_path)

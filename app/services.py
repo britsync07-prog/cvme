@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 import yaml
@@ -89,10 +89,20 @@ def _public_url(value: str) -> str:
 
 
 def _website_text(website: str) -> tuple[str, str]:
-    response = httpx.get(
-        _public_url(website), timeout=15, follow_redirects=True,
-        headers={"User-Agent": "TailorMail research bot/1.0"},
-    )
+    current = _public_url(website)
+    response = None
+    for _ in range(4):
+        response = httpx.get(
+            current, timeout=15, follow_redirects=False,
+            headers={"User-Agent": "TailorMail research bot/1.0"},
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            break
+        location = response.headers.get("location")
+        if not location:
+            break
+        current = _public_url(urljoin(current, location))
+    assert response is not None
     response.raise_for_status()
     text = re.sub(r"<[^>]+>", " ", response.text)
     return str(response.url), re.sub(r"\s+", " ", text).strip()
@@ -301,7 +311,7 @@ def candidates_from_zip(contents: bytes) -> list[tuple[str, str, str]]:
         data = yaml.safe_load(raw)
         cv = data.get("cv", {}) if isinstance(data, dict) else {}
         name, email = cv.get("name"), cv.get("email")
-        if not isinstance(name, str) or not name.strip() or not isinstance(email, str) or "@" not in email:
+        if not isinstance(name, str) or not name.strip() or not isinstance(email, str) or "@" not in email or not isinstance(cv.get("sections", {}), dict):
             raise ValueError(f"{entry.filename} needs cv.name and cv.email.")
         result.append((name.strip(), email.strip(), raw))
     return result

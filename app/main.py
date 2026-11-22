@@ -12,6 +12,7 @@ import redis
 import pyotp
 import logging
 import sentry_sdk
+import yaml
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -318,7 +319,7 @@ def cookies_page(request: Request):
 
 @app.get("/robots.txt", include_in_schema=False)
 def robots():
-    return PlainTextResponse("User-agent: *\nDisallow: /\nAllow: /landing\nAllow: /pricing\nAllow: /terms\nAllow: /privacy\nAllow: /acceptable-use\nAllow: /refunds\nAllow: /contact\nAllow: /cookies\nSitemap: /sitemap.xml\n")
+    return PlainTextResponse("User-agent: *\nDisallow: /admin\nDisallow: /settings\nDisallow: /campaigns\nDisallow: /candidates\nDisallow: /jobs\nDisallow: /billing\nDisallow: /support\nDisallow: /leads\nSitemap: /sitemap.xml\n")
 
 
 @app.get("/sitemap.xml", include_in_schema=False)
@@ -1427,10 +1428,22 @@ def admin_system_settings(request: Request, signup_enabled: bool = Form(False), 
 def create_candidate(request: Request = None, name: str = Form(), email: str = Form(), cv_yaml: str = Form(), consent: bool = Form(False)):
     if not consent:
         raise HTTPException(400, "Candidate consent is required before processing their CV.")
+    try:
+        document = yaml.safe_load(cv_yaml) or {}
+    except yaml.YAMLError as exc:
+        raise HTTPException(400, "Candidate CV must be valid YAML.") from exc
+    cv = document.get("cv") if isinstance(document, dict) else None
+    if not isinstance(cv, dict) or not isinstance(cv.get("sections", {}), dict):
+        raise HTTPException(400, "Candidate CV must contain a RenderCV cv object and sections mapping.")
+    normalized_email = email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized_email):
+        raise HTTPException(400, "A valid candidate email is required.")
+    if str(cv.get("name", "")).strip() != name.strip() or str(cv.get("email", "")).strip().lower() != normalized_email:
+        raise HTTPException(400, "Candidate name and email must match cv.name and cv.email in the RenderCV YAML.")
     with SessionLocal() as db:
         workspace, user = current_workspace(request, db) if request else ensure_default_workspace(db)
         require_candidate_slot(db, workspace)
-        candidate = Candidate(workspace_id=workspace.id, user_id=user.id, name=name.strip(), email=email.strip(), cv_yaml=cv_yaml)
+        candidate = Candidate(workspace_id=workspace.id, user_id=user.id, name=name.strip(), email=normalized_email, cv_yaml=cv_yaml)
         db.add(candidate)
         db.commit()
     return RedirectResponse("/?tab=candidates", status_code=303)
@@ -1488,6 +1501,12 @@ def create_campaign(
     recipient_email: str = Form(),
     auto_prepare: bool = Form(False),
 ):
+    company_name = company_name.strip()
+    recipient_email = recipient_email.strip().lower()
+    if not company_name or len(company_name) > 300:
+        raise HTTPException(400, "Company name is required and must be at most 300 characters.")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", recipient_email):
+        raise HTTPException(400, "A valid recipient email is required.")
     with SessionLocal() as db:
         if request:
             workspace, user = current_workspace(request, db)
@@ -1504,11 +1523,11 @@ def create_campaign(
             workspace_id=workspace.id,
             user_id=user.id,
             candidate_id=candidate_id,
-            company_name=company_name.strip(),
+            company_name=company_name,
             company_url=company_url.strip() or None,
             target_role=target_role.strip() or None,
             job_description=job_description.strip() or None,
-            recipient_email=recipient_email.strip(),
+            recipient_email=recipient_email,
         )
         db.add(campaign)
         db.commit()

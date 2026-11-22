@@ -967,6 +967,7 @@ def admin_dashboard(request: Request):
                 "sent_count": db.scalar(select(func.count(Campaign.id)).where(Campaign.status == "sent")) or 0,
                 "audit_count": db.scalar(select(func.count(AuditLog.id))) or 0,
                 "kill_switch": kill_switch_enabled(),
+                "plans": db.scalars(select(Plan).where(Plan.active.is_(True)).order_by(Plan.id)).all(),
             },
         )
 
@@ -1063,6 +1064,38 @@ def admin_force_logout(request: Request, user_id: int):
             raise HTTPException(404, "User not found.")
         db.query(SessionToken).filter(SessionToken.user_id == target.id, SessionToken.revoked_at.is_(None)).update({SessionToken.revoked_at: utc_now()})
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="user_force_logout", entity_type="user", entity_id=target.id, detail={}))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/reset-password")
+def admin_reset_password(request: Request, user_id: int):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        target = db.get(User, user_id)
+        if not target or not target.is_active:
+            raise HTTPException(404, "Active user not found.")
+        raw = new_token()
+        db.add(PasswordResetToken(user_id=target.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=1)))
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="admin_password_reset_requested", entity_type="user", entity_id=target.id, detail={}))
+        db.commit()
+        try:
+            send_system_email(target.email, "Reset your TailorMail password", f"An administrator requested a password reset. Use {settings.base_url}/reset-password?token={raw} within one hour.")
+        except Exception:
+            logging.getLogger("tailormail").warning("Could not send admin password reset email", exc_info=True)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/note")
+def admin_user_note(request: Request, user_id: int, note: str = Form()):
+    if not note.strip():
+        raise HTTPException(400, "Note is required.")
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        target = db.get(User, user_id)
+        if not target:
+            raise HTTPException(404, "User not found.")
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="admin_user_note", entity_type="user", entity_id=target.id, detail={"note": note.strip()[:2000]}))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 
@@ -1172,6 +1205,22 @@ def admin_extend_trial(request: Request, workspace_id: int, days: int = Form()):
         subscription.trial_ends_at = (subscription.trial_ends_at or utc_now()) + timedelta(days=days)
         subscription.status = "trialing"
         db.add(AuditLog(workspace_id=workspace_id, user_id=actor.id, action="trial_adjusted", entity_type="workspace", entity_id=workspace_id, detail={"days": days}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/workspaces/{workspace_id}/plan")
+def admin_assign_plan(request: Request, workspace_id: int, plan_slug: str = Form()):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        workspace = db.get(Workspace, workspace_id)
+        plan = db.scalar(select(Plan).where(Plan.slug == plan_slug, Plan.active.is_(True)))
+        subscription = db.scalar(select(Subscription).where(Subscription.workspace_id == workspace_id).order_by(Subscription.id.desc()))
+        if not workspace or not plan or not subscription:
+            raise HTTPException(404, "Workspace, plan, or subscription not found.")
+        subscription.plan_id = plan.id
+        subscription.status = "active"
+        db.add(AuditLog(workspace_id=workspace.id, user_id=actor.id, action="plan_assigned", entity_type="workspace", entity_id=workspace.id, detail={"plan": plan.slug}))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 

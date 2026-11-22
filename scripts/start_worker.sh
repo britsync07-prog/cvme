@@ -1,4 +1,5 @@
 #!/bin/sh
 set -eu
-alembic upgrade head
+# Schema migrations are owned by the web service. Running them here would race
+# with app startup when worker and scheduler containers start together.
 exec "$@"

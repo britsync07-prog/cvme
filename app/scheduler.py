@@ -10,6 +10,7 @@ from sqlalchemy import select
 from .config import settings
 from .db import SessionLocal
 from .models import Notification, User, Subscription, Workspace
+from .ops import enqueue_job, kill_switch_enabled
 
 
 def run() -> None:
@@ -34,12 +35,13 @@ def run() -> None:
                             reminder_key = f"tailormail:trial-reminder:{workspace.id}:{days_left}:{local.date().isoformat()}"
                             owner = db.get(User, workspace.owner_user_id)
                             if owner and client.set(reminder_key, "1", nx=True, ex=172800):
-                                client.lpush("tailormail:jobs", json.dumps({"type": "trial_reminder", "workspace_id": workspace.id, "email": owner.email, "days_left": days_left}))
+                                enqueue_job("trial_reminder", {"email": owner.email, "days_left": days_left}, workspace.id, owner.id)
                                 db.add(Notification(workspace_id=workspace.id, user_id=owner.id, kind="trial_reminder", message=f"Your trial has {days_left} day(s) remaining."))
                                 db.commit()
                     key = f"tailormail:scheduled:{workspace.id}:{local.date().isoformat()}"
                     if client.set(key, "1", nx=True, ex=172800):
-                        client.lpush("tailormail:jobs", json.dumps({"type": "daily_outreach", "workspace_id": workspace.id, "scheduled_at": local.isoformat()}))
+                        if not kill_switch_enabled():
+                            enqueue_job("daily_outreach", {"scheduled_at": local.isoformat()}, workspace.id, workspace.owner_user_id)
         except Exception:
             # Keep the scheduler alive during a transient database restart/migration.
             time.sleep(5)

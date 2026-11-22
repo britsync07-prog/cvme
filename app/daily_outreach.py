@@ -12,6 +12,7 @@ from .main import discover_lead_batch, remaining_daily_send_budget
 from .models import Candidate, EmailAccount, Workspace
 from .services import cv_outreach_readiness_error
 from .tenancy import ensure_default_workspace
+from .ops import kill_switch_enabled, mark_job
 
 
 def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
@@ -81,9 +82,11 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
     return errors
 
 
-def main(workspace_id: int | None = None) -> None:
-    if settings.outreach_kill_switch:
+def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
+    if kill_switch_enabled():
         raise SystemExit("Outreach kill switch is enabled.")
+    if job_id:
+        mark_job(job_id, "running", progress=5)
     errors = production_preflight_errors(workspace_id)
     if errors:
         raise SystemExit("\n".join(errors))
@@ -96,6 +99,8 @@ def main(workspace_id: int | None = None) -> None:
                 remaining = remaining_daily_send_budget(db)
         if remaining == 0:
             print(json.dumps(totals))
+            if job_id:
+                mark_job(job_id, "succeeded", progress=100)
             return
         with SessionLocal() as db:
             workspace = db.get(Workspace, workspace_id) if workspace_id else ensure_default_workspace(db)[0]
@@ -114,16 +119,24 @@ def main(workspace_id: int | None = None) -> None:
         result = json.loads(response.body)
         for key in totals:
             totals[key] += result[key]
+        if job_id:
+            mark_job(job_id, "running", progress=min(95, 5 + totals["discovered"]))
         if not settings.outreach_auto_send:
             print(json.dumps(totals))
             if result["completed"] < remaining:
+                if job_id:
+                    mark_job(job_id, "failed", progress=100, error="Daily preparation target missed.")
                 raise SystemExit(
                     f"Daily preparation target missed: prepared {result['completed']} of {remaining}."
                 )
+            if job_id:
+                mark_job(job_id, "succeeded", progress=100)
             return
         if result["discovered"] == 0:
             print(json.dumps(totals))
             action = "send" if settings.outreach_auto_send else "preparation"
+            if job_id:
+                mark_job(job_id, "failed", progress=100, error=f"Daily {action} target missed.")
             raise SystemExit(f"Daily {action} target missed: {remaining} slots remain; no new verified leads were available.")
         if result["completed"] == 0:
             # A failed AI/render/send attempt must not prevent trying the next lead.

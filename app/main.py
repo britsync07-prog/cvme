@@ -27,7 +27,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_feature, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, PasswordResetToken, Plan, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, OutreachJob, PasswordResetToken, Plan, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
+from .ops import enqueue_job, kill_switch_enabled, mark_job, set_setting, setting_value
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
@@ -692,9 +693,35 @@ def disable_2fa(request: Request, code: str = Form()):
 
 @app.post("/jobs/daily-outreach")
 def enqueue_daily_outreach(request: Request):
-    # Queue work and return immediately; the worker owns retries and execution.
-    redis.Redis.from_url(settings.redis_url).lpush("tailormail:jobs", json.dumps({"type": "daily_outreach", "requested_at": utc_now().isoformat()}))
-    return JSONResponse({"queued": True})
+    # Queue work and return immediately; durable job state is visible to the dashboard.
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+    job_id = enqueue_job("daily_outreach", {"requested_at": utc_now().isoformat()}, workspace.id, user.id)
+    return JSONResponse({"queued": True, "job_id": job_id})
+
+
+@app.get("/jobs/{job_id}")
+def job_status(request: Request, job_id: int):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        job = db.scalar(select(OutreachJob).where(OutreachJob.id == job_id, OutreachJob.workspace_id == workspace.id))
+        if not job:
+            raise HTTPException(404, "Job not found.")
+        return JSONResponse({"id": job.id, "type": job.job_type, "status": job.status, "progress": job.progress, "attempts": job.attempts, "error": job.error, "created_at": job.created_at.isoformat(), "started_at": job.started_at.isoformat() if job.started_at else None, "finished_at": job.finished_at.isoformat() if job.finished_at else None})
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(request: Request, job_id: int):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        job = db.scalar(select(OutreachJob).where(OutreachJob.id == job_id, OutreachJob.workspace_id == workspace.id))
+        if not job:
+            raise HTTPException(404, "Job not found.")
+        if job.status in {"queued", "running"}:
+            job.status = "cancelled"
+            job.finished_at = utc_now()
+            db.commit()
+    return RedirectResponse("/?tab=settings", status_code=303)
 
 
 @app.post("/notifications/{notification_id}/read")
@@ -769,6 +796,7 @@ def dashboard(request: Request, tab: str = "applications"):
         subscription_status = status_for(db, workspace)
         notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(20)).all()
         blocklist = db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id, Suppression.reason == "workspace_blocklist").order_by(Suppression.created_at.desc())).all()
+        jobs = db.scalars(select(OutreachJob).where(OutreachJob.workspace_id == workspace.id).order_by(OutreachJob.created_at.desc()).limit(10)).all()
         email_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
         ai_config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
         return templates.TemplateResponse(
@@ -789,6 +817,7 @@ def dashboard(request: Request, tab: str = "applications"):
                 "email_account": email_account,
                 "ai_config": ai_config,
                 "blocklist": blocklist,
+                "jobs": jobs,
             },
         )
 
@@ -853,6 +882,7 @@ def admin_dashboard(request: Request):
                 "campaign_count": db.scalar(select(func.count(Campaign.id))) or 0,
                 "sent_count": db.scalar(select(func.count(Campaign.id)).where(Campaign.status == "sent")) or 0,
                 "audit_count": db.scalar(select(func.count(AuditLog.id))) or 0,
+                "kill_switch": kill_switch_enabled(),
             },
         )
 
@@ -881,7 +911,8 @@ def admin_metrics(request: Request):
         _require_admin(request, db)
         status_counts = dict(db.execute(select(Campaign.status, func.count(Campaign.id)).group_by(Campaign.status)).all())
         subscriptions = db.scalars(select(Subscription)).all()
-        return JSONResponse({"users": db.scalar(select(func.count(User.id))) or 0, "workspaces": db.scalar(select(func.count(Workspace.id)).where(Workspace.deleted_at.is_(None))) or 0, "active_subscriptions": sum(1 for item in subscriptions if item.status == "active"), "trialing": sum(1 for item in subscriptions if item.status == "trialing"), "sent": status_counts.get("sent", 0), "failed": status_counts.get("failed", 0) + status_counts.get("send_uncertain", 0), "campaign_status": status_counts})
+        jobs = dict(db.execute(select(OutreachJob.status, func.count(OutreachJob.id)).group_by(OutreachJob.status)).all())
+        return JSONResponse({"users": db.scalar(select(func.count(User.id))) or 0, "workspaces": db.scalar(select(func.count(Workspace.id)).where(Workspace.deleted_at.is_(None))) or 0, "active_subscriptions": sum(1 for item in subscriptions if item.status == "active"), "trialing": sum(1 for item in subscriptions if item.status == "trialing"), "sent": status_counts.get("sent", 0), "failed": status_counts.get("failed", 0) + status_counts.get("send_uncertain", 0), "campaign_status": status_counts, "job_status": jobs, "kill_switch": kill_switch_enabled()})
 
 
 @app.get("/admin/email-log")
@@ -920,6 +951,32 @@ def admin_user_role(request: Request, user_id: int, role: str = Form()):
             raise HTTPException(404, "User not found.")
         target.role = role
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="user_role_changed", entity_type="user", entity_id=target.id, detail={"role": role}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/verify")
+def admin_user_verify(request: Request, user_id: int):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        target = db.get(User, user_id)
+        if not target:
+            raise HTTPException(404, "User not found.")
+        target.email_verified_at = target.email_verified_at or utc_now()
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="user_verified", entity_type="user", entity_id=target.id, detail={}))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/force-logout")
+def admin_force_logout(request: Request, user_id: int):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        target = db.get(User, user_id)
+        if not target:
+            raise HTTPException(404, "User not found.")
+        db.query(SessionToken).filter(SessionToken.user_id == target.id, SessionToken.revoked_at.is_(None)).update({SessionToken.revoked_at: utc_now()})
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="user_force_logout", entity_type="user", entity_id=target.id, detail={}))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 
@@ -975,6 +1032,21 @@ def admin_support(request: Request):
         _require_admin(request, db)
         tickets = db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(500)).all()
         return JSONResponse({"tickets": [{"id": t.id, "workspace_id": t.workspace_id, "user_id": t.user_id, "subject": t.subject, "body": t.body, "status": t.status, "created_at": t.created_at.isoformat()} for t in tickets]})
+
+
+@app.post("/admin/support/{ticket_id}/status")
+def admin_support_status(request: Request, ticket_id: int, status: str = Form()):
+    if status not in {"open", "pending", "resolved", "closed"}:
+        raise HTTPException(400, "Invalid ticket status.")
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        ticket = db.get(SupportTicket, ticket_id)
+        if not ticket:
+            raise HTTPException(404, "Ticket not found.")
+        ticket.status = status
+        db.add(AuditLog(workspace_id=ticket.workspace_id, user_id=actor.id, action="support_ticket_status_changed", entity_type="support_ticket", entity_id=ticket.id, detail={"status": status}))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/suppression")
@@ -1045,6 +1117,7 @@ def admin_kill_switch(request: Request, enabled: bool = Form()):
     with SessionLocal() as db:
         actor = _require_admin(request, db)
         update_settings(outreach_kill_switch=enabled)
+        set_setting(db, "outreach_kill_switch", "true" if enabled else "false")
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="kill_switch_changed", entity_type="system", detail={"enabled": enabled}, ip_address=request.client.host if request.client else None))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
@@ -1351,7 +1424,7 @@ def preview_pdf(request: Request, campaign_id: int):
 def send_campaign(campaign_id: int, approved: bool = Form(False), request: Request = None, workspace_id: int | None = None):
     if not approved:
         raise HTTPException(400, "Explicit approval is required to send.")
-    if settings.outreach_kill_switch:
+    if kill_switch_enabled():
         raise HTTPException(503, "Outreach sending is temporarily paused by the administrator.")
     with SessionLocal() as db:
         if request:

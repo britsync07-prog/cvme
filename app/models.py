@@ -275,3 +275,27 @@ class Suppression(Base):
     domain: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     reason: Mapped[str] = mapped_column(String(80), default="unsubscribe")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class OutreachJob(Base):
+    __tablename__ = "outreach_jobs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int | None] = mapped_column(ForeignKey("workspaces.id"), nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    job_type: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -6,6 +6,7 @@ import re
 import secrets
 import hashlib
 import hmac
+import redis
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -422,6 +423,13 @@ def delete_account(request: Request):
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
+
+
+@app.post("/jobs/daily-outreach")
+def enqueue_daily_outreach(request: Request):
+    # Queue work and return immediately; the worker owns retries and execution.
+    redis.Redis.from_url(settings.redis_url).lpush("tailormail:jobs", json.dumps({"type": "daily_outreach", "requested_at": utc_now().isoformat()}))
+    return JSONResponse({"queued": True})
 
 
 @app.get("/unsubscribe")

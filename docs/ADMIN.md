@@ -1,5 +1,7 @@
 # Administrator guide
 
+The admin surface is available at `/admin` for `admin` and `superadmin` users. JSON drill-down endpoints include `/admin/users/{id}`, `/admin/campaigns`, `/admin/metrics`, `/admin/email-log`, and `/admin/support`.
+
 1. Configure `.env` and run `docker compose up -d`; the app, worker, scheduler, Redis, and PostgreSQL are health-checked independently.
 2. Open `/admin` with the configured owner/admin account. Use `/admin/users` for filtered JSON, the user controls for activation/roles, and `/admin/audit.csv` for audit export.
 3. Configure Stripe price IDs in the database `plans` rows before enabling Checkout. Set `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and point Stripe to `/billing/webhook`.

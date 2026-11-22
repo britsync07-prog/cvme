@@ -59,6 +59,17 @@ services:
       - artifacts:/app/artifacts
     restart: unless-stopped
 
+  scheduler:
+    build: .
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "app.scheduler"]
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   artifacts:

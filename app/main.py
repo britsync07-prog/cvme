@@ -25,7 +25,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, PasswordResetToken, Plan, Subscription, Suppression, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Notification, PasswordResetToken, Plan, Subscription, SupportTicket, Suppression, User, Workspace, WorkspaceMembership
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
@@ -607,6 +607,18 @@ def enqueue_daily_outreach(request: Request):
     return JSONResponse({"queued": True})
 
 
+@app.post("/notifications/{notification_id}/read")
+def mark_notification_read(request: Request, notification_id: int):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        notification = db.scalar(select(Notification).where(Notification.id == notification_id, Notification.workspace_id == workspace.id))
+        if not notification:
+            raise HTTPException(404, "Notification not found.")
+        notification.read_at = utc_now()
+        db.commit()
+    return RedirectResponse("/", status_code=303)
+
+
 @app.get("/unsubscribe")
 def unsubscribe(email: str, workspace_id: int | None = None):
     normalized = email.strip().lower()
@@ -620,6 +632,13 @@ def unsubscribe(email: str, workspace_id: int | None = None):
 
 def audit(db, campaign: Campaign, action: str, detail: str, user_id: int | None = None) -> None:
     db.add(AuditEvent(campaign_id=campaign.id, workspace_id=campaign.workspace_id, user_id=user_id or campaign.user_id, action=action, detail=detail))
+
+
+PERSONAL_EMAIL_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "aol.com", "proton.me", "protonmail.com"}
+
+
+def corporate_recipient(email: str) -> bool:
+    return "@" in email and email.rsplit("@", 1)[-1].lower() not in PERSONAL_EMAIL_DOMAINS
 
 
 def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
@@ -651,6 +670,8 @@ def dashboard(request: Request, tab: str = "applications"):
         except ValueError:
             daily_remaining = 0
         subscription_status = status_for(db, workspace)
+        notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(20)).all()
+        email_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -664,8 +685,55 @@ def dashboard(request: Request, tab: str = "applications"):
                 "settings": settings,
                 "subscription_status": subscription_status,
                 "workspace": workspace,
+                "notifications": notifications,
+                "email_account": email_account,
             },
         )
+
+
+@app.get("/onboarding")
+def onboarding(request: Request):
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        candidate_count = db.scalar(select(func.count(Candidate.id)).where(workspace_filter(Candidate, workspace), Candidate.deleted_at.is_(None))) or 0
+        ai_configured = bool(db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id)))
+        sender_configured = bool(db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active")))
+    return templates.TemplateResponse(request, "onboarding.html", {"workspace": workspace, "user": user, "candidate_count": candidate_count, "ai_configured": ai_configured, "sender_configured": sender_configured})
+
+
+@app.get("/sent")
+def sent_emails(request: Request):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace), Campaign.status == "sent", Campaign.deleted_at.is_(None)).order_by(Campaign.sent_at.desc())).all()
+    return templates.TemplateResponse(request, "sent.html", {"campaigns": campaigns})
+
+
+@app.get("/leads")
+def leads_page(request: Request):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)).order_by(Campaign.created_at.desc())).all()
+    return templates.TemplateResponse(request, "leads.html", {"campaigns": campaigns})
+
+
+@app.get("/support")
+def support_page(request: Request):
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        tickets = db.scalars(select(SupportTicket).where(SupportTicket.workspace_id == workspace.id, SupportTicket.user_id == user.id).order_by(SupportTicket.created_at.desc())).all()
+    return templates.TemplateResponse(request, "support.html", {"tickets": tickets, "error": ""})
+
+
+@app.post("/support")
+def create_support_ticket(request: Request, subject: str = Form(), body: str = Form()):
+    if not subject.strip() or not body.strip():
+        raise HTTPException(400, "Subject and message are required.")
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        db.add(SupportTicket(workspace_id=workspace.id, user_id=user.id, subject=subject.strip()[:300], body=body.strip()[:10000]))
+        db.commit()
+    return RedirectResponse("/support", status_code=303)
 
 
 @app.get("/admin")
@@ -805,6 +873,7 @@ def delete_candidate(request: Request, candidate_id: int):
 @app.post("/campaigns")
 def create_campaign(
     request: Request = None,
+    workspace_id: int | None = None,
     candidate_id: int = Form(),
     company_name: str = Form(),
     company_url: str = Form(""),
@@ -814,7 +883,15 @@ def create_campaign(
     auto_prepare: bool = Form(False),
 ):
     with SessionLocal() as db:
-        workspace, user = current_workspace(request, db) if request else ensure_default_workspace(db)
+        if request:
+            workspace, user = current_workspace(request, db)
+        elif workspace_id:
+            workspace = db.get(Workspace, workspace_id)
+            user = db.get(User, workspace.owner_user_id) if workspace else None
+            if not workspace or not user:
+                raise HTTPException(404, "Workspace not found")
+        else:
+            workspace, user = ensure_default_workspace(db)
         candidate = require_owned(db, Candidate, candidate_id, workspace)
         campaign = Campaign(
             workspace_id=workspace.id,
@@ -834,15 +911,20 @@ def create_campaign(
         campaign_id = campaign.id
 
     if auto_prepare:
-        return prepare_campaign(campaign_id, request=request)
+        return prepare_campaign(campaign_id, request=request, workspace_id=workspace_id)
 
     return RedirectResponse(f"/campaigns/{campaign_id}", status_code=303)
 
 
 @app.post("/leads/discover")
-def discover_lead(request: Request = None, candidate_id: int = Form(), query: str = Form(), target_role: str = Form("")):
+def discover_lead(request: Request = None, workspace_id: int | None = None, candidate_id: int = Form(), query: str = Form(), target_role: str = Form("")):
     with SessionLocal() as db:
-        workspace, _ = current_workspace(request, db) if request else ensure_default_workspace(db)
+        if request:
+            workspace, _ = current_workspace(request, db)
+        elif workspace_id:
+            workspace = db.get(Workspace, workspace_id)
+        else:
+            workspace, _ = ensure_default_workspace(db)
         require_owned(db, Candidate, candidate_id, workspace)
     try:
         lead = discover_company_lead(query.strip())
@@ -857,12 +939,14 @@ def discover_lead(request: Request = None, candidate_id: int = Form(), query: st
         recipient_email=lead["recipient_email"],
         auto_prepare=True,
         request=request,
+        workspace_id=workspace_id,
     )
 
 
 @app.post("/leads/batch")
 def discover_lead_batch(
     request: Request = None,
+    workspace_id: int | None = None,
     candidate_id: int = Form(),
     query: str = Form(),
     target_role: str = Form(""),
@@ -871,7 +955,12 @@ def discover_lead_batch(
 ):
     limit = min(max(limit, 1), 100)
     with SessionLocal() as db:
-        workspace, _ = current_workspace(request, db) if request else ensure_default_workspace(db)
+        if request:
+            workspace, _ = current_workspace(request, db)
+        elif workspace_id:
+            workspace = db.get(Workspace, workspace_id)
+        else:
+            workspace, _ = ensure_default_workspace(db)
         require_owned(db, Candidate, candidate_id, workspace)
         existing_names = {name.casefold() for name in db.scalars(select(Campaign.company_name).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))).all()}
         existing_numbers = {
@@ -902,10 +991,11 @@ def discover_lead_batch(
                 recipient_email=lead["recipient_email"],
                 auto_prepare=True,
                 request=request,
+                workspace_id=workspace_id,
             )
             if send_when_ready:
                 campaign_id = int(response.headers["location"].rsplit("/", 1)[-1])
-                send_campaign(campaign_id, approved=True, request=request)
+                send_campaign(campaign_id, approved=True, request=request, workspace_id=workspace_id)
             completed += 1
         except HTTPException:
             continue
@@ -930,9 +1020,14 @@ def campaign_detail(request: Request, campaign_id: int):
 
 
 @app.post("/campaigns/{campaign_id}/prepare")
-def prepare_campaign(campaign_id: int, request: Request = None):
+def prepare_campaign(campaign_id: int, request: Request = None, workspace_id: int | None = None):
     with SessionLocal() as db:
-        workspace, _ = current_workspace(request, db) if request else ensure_default_workspace(db)
+        if request:
+            workspace, _ = current_workspace(request, db)
+        elif workspace_id:
+            workspace = db.get(Workspace, workspace_id)
+        else:
+            workspace, _ = ensure_default_workspace(db)
         campaign = require_owned(db, Campaign, campaign_id, workspace)
         try:
             campaign.status = "researching"
@@ -1017,15 +1112,25 @@ def preview_pdf(request: Request, campaign_id: int):
 
 
 @app.post("/campaigns/{campaign_id}/send")
-def send_campaign(campaign_id: int, approved: bool = Form(False), request: Request = None):
+def send_campaign(campaign_id: int, approved: bool = Form(False), request: Request = None, workspace_id: int | None = None):
     if not approved:
         raise HTTPException(400, "Explicit approval is required to send.")
     with SessionLocal() as db:
-        workspace, user = current_workspace(request, db)
+        if request:
+            workspace, user = current_workspace(request, db)
+        elif workspace_id:
+            workspace = db.get(Workspace, workspace_id)
+            user = db.get(User, workspace.owner_user_id) if workspace else None
+            if not workspace or not user:
+                raise HTTPException(404, "Workspace not found")
+        else:
+            workspace, user = ensure_default_workspace(db)
         require_send_slot(db, workspace)
         recipient = campaign_recipient = db.scalar(select(Campaign.recipient_email).where(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id))
         recipient_domain = recipient.rsplit("@", 1)[-1].lower() if recipient and "@" in recipient else ""
-        suppressed = db.scalar(select(Suppression).where(Suppression.email == (recipient or "").lower())) or db.scalar(select(Suppression).where(Suppression.domain == recipient_domain, Suppression.workspace_id.is_(None)))
+        if not corporate_recipient(recipient or ""):
+            raise HTTPException(400, "Only verified corporate addresses can receive outreach.")
+        suppressed = db.scalar(select(Suppression).where(Suppression.email == (recipient or "").lower(), (Suppression.workspace_id == workspace.id) | Suppression.workspace_id.is_(None))) or db.scalar(select(Suppression).where(Suppression.domain == recipient_domain, (Suppression.workspace_id == workspace.id) | Suppression.workspace_id.is_(None)))
         if suppressed:
             raise HTTPException(400, "This recipient is suppressed and cannot be contacted.")
         claimed = db.execute(
@@ -1057,10 +1162,12 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
             if provider_message_id:
                 detail += f" Provider message ID: {provider_message_id}."
             audit(db, campaign, "sent", detail, user.id)
+            db.add(Notification(workspace_id=workspace.id, user_id=user.id, kind="campaign_sent", message=f"Application sent to {campaign.recipient_email}."))
             db.commit()
         except Exception as exc:
             campaign.status = "send_uncertain"
             audit(db, campaign, "send_uncertain", str(exc))
+            db.add(Notification(workspace_id=workspace.id, user_id=user.id, kind="send_error", message=f"Delivery failed for {campaign.recipient_email}."))
             db.commit()
             raise HTTPException(
                 400,
@@ -1117,6 +1224,9 @@ def save_settings(
         workspace.timezone = outreach_timezone.strip() or workspace.timezone
         workspace.schedule_time = outreach_schedule_time.strip()
         workspace.daily_limit = min(max(outreach_daily_limit, 1), 100)
+        workspace.outreach_candidate_id = max(outreach_candidate_id, 0) or None
+        workspace.outreach_query = outreach_query.strip()
+        workspace.outreach_target_role = outreach_target_role.strip()
         if api_key.strip():
             config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
             if not config:
@@ -1157,10 +1267,19 @@ def save_settings(
 
 @app.post("/settings/test-llm")
 def api_test_llm(
+    request: Request,
     base_url: str = Form("http://127.0.0.1:31415"),
     api_key: str = Form(""),
     llm_model: str = Form("local-model"),
 ):
+    if not api_key.strip():
+        with SessionLocal() as db:
+            workspace, _ = current_workspace(request, db)
+            config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
+            if config:
+                api_key = decrypt_secret(config.encrypted_api_key)
+                base_url = config.base_url
+                llm_model = config.model_name
     result = test_llm_connection(base_url.strip(), api_key.strip(), llm_model.strip())
     return JSONResponse(result)
 

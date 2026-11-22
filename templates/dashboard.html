@@ -42,6 +42,7 @@
   </nav>
 
   <main class="main-content">
+    {% if notifications %}<section class="panel"><div class="panel-header"><h2>Notifications</h2></div>{% for notice in notifications %}<div class="notice-row"><span>{{ notice.message }}</span><form method="post" action="/notifications/{{ notice.id }}/read"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small ghost" type="submit">Mark read</button></form></div>{% endfor %}</section>{% endif %}
     {% if subscription_status and subscription_status.trial_active %}<div class="panel trial-banner"><strong>{{ subscription_status.trial_days_left }} trial days remaining.</strong> Upgrade before your trial ends to keep sending.</div>{% elif subscription_status and not subscription_status.active %}<div class="panel login-error"><strong>Sending is paused.</strong> Your trial or subscription is inactive.</div>{% endif %}
     {% if active_tab == 'applications' %}
     <!-- APPLICATIONS TAB -->
@@ -441,7 +442,8 @@
             </div>
           </div>
           <div id="smtp-test-result" class="test-feedback"></div>
-          <div class="panel-header"><div><h3>Gmail sender</h3><p class="subtitle">Connect your own Gmail account with the minimum send scope.</p></div><a class="button-link" href="/settings/gmail/connect">Connect Gmail</a></div>
+          <div class="panel-header"><div><h3>Workspace sender</h3><p class="subtitle">{{ email_account.email if email_account else 'No tenant sender connected' }}. Connect Gmail or save encrypted SMTP credentials below.</p></div><a class="button-link" href="/settings/gmail/connect">Connect Gmail</a></div>
+          <form action="/settings/email-account" method="post" class="standard-form"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><div class="form-row"><label class="field"><span>SMTP from email</span><input name="email" type="email" placeholder="you@company.com" required></label><label class="field"><span>SMTP host</span><input name="host" placeholder="smtp.example.com" required></label></div><div class="form-row"><label class="field"><span>Port</span><input name="port" type="number" value="587"></label><label class="field"><span>Username</span><input name="username"></label></div><div class="form-row"><label class="field"><span>Password</span><input name="password" type="password"></label><label class="checkbox-label"><input name="use_tls" type="checkbox" value="true" checked><span>Use TLS</span></label></div><button class="button secondary" type="submit">Save encrypted SMTP account</button></form>
         </div>
 
         <div class="settings-section">
@@ -461,7 +463,7 @@
           <div class="form-row">
             <label class="field">
               <span>Scheduled candidate</span>
-              <select name="outreach_candidate_id">{% for c in candidates %}<option value="{{ c.id }}" {% if c.id == settings.outreach_candidate_id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}</select>
+              <select name="outreach_candidate_id">{% for c in candidates %}<option value="{{ c.id }}" {% if c.id == workspace.outreach_candidate_id %}selected{% endif %}>{{ c.name }}</option>{% endfor %}</select>
             </label>
             <label class="field">
               <span>Daily lead limit</span>
@@ -471,11 +473,11 @@
           <div class="form-row">
             <label class="field">
               <span>Companies House query</span>
-              <input name="outreach_query" value="{{ settings.outreach_query }}" placeholder="e.g. software, consulting, engineering">
+              <input name="outreach_query" value="{{ workspace.outreach_query }}" placeholder="e.g. software, consulting, engineering">
             </label>
             <label class="field">
               <span>Target role</span>
-              <input name="outreach_target_role" value="{{ settings.outreach_target_role }}" placeholder="e.g. Software Engineer">
+              <input name="outreach_target_role" value="{{ workspace.outreach_target_role }}" placeholder="e.g. Software Engineer">
             </label>
           </div>
           <label class="field"><span>Daily schedule timezone</span><input name="outreach_timezone" value="{{ settings.outreach_timezone }}" placeholder="e.g. Asia/Dhaka"></label>

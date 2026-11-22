@@ -16,7 +16,7 @@ def run() -> None:
             job = json.loads(payload)
             if job.get("type") == "daily_outreach":
                 from .daily_outreach import main
-                main()
+                main(job.get("workspace_id"))
             else:
                 log.warning("Unknown job type: %s", job.get("type"))
         except Exception:

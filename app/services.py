@@ -245,6 +245,17 @@ def research_company(
             website_host = urlparse(website_url).hostname
             # Collect evidence about both the business and what it hires for.
             seen_sources = {website_url}
+            parsed_website = urlparse(website_url)
+            for suffix in ("/contact", "/contact-us", "/careers"):
+                if len(sources) >= 4:
+                    break
+                try:
+                    contact_url, contact_text = _website_text(f"{parsed_website.scheme}://{parsed_website.netloc}{suffix}")
+                except (httpx.HTTPError, ValueError, KeyError):
+                    continue
+                if contact_url not in seen_sources:
+                    seen_sources.add(contact_url)
+                    sources.append({"url": contact_url, "content": contact_text[:12000]})
             research_queries = [
                 f"{name} company services technology",
                 f"{name} careers jobs hiring {target_role or ''}",

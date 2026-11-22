@@ -658,6 +658,16 @@ async def resend_webhook(request: Request):
     with SessionLocal() as db:
         if not db.scalar(select(Suppression).where(Suppression.workspace_id.is_(None), Suppression.email == recipient, Suppression.reason.in_(["bounce", "complaint"]))):
             db.add(Suppression(workspace_id=None, email=recipient, reason="complaint" if event_type == "email.complained" else "bounce"))
+        affected = db.scalars(select(Campaign).where(Campaign.recipient_email == recipient, Campaign.status == "sent")).all()
+        notified: set[int] = set()
+        for campaign in affected:
+            account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == campaign.workspace_id, EmailAccount.status == "active").order_by(EmailAccount.id))
+            if account:
+                account.status = "paused"
+            workspace = db.get(Workspace, campaign.workspace_id) if campaign.workspace_id else None
+            if workspace and workspace.owner_user_id not in notified:
+                db.add(Notification(workspace_id=workspace.id, user_id=workspace.owner_user_id, kind="sender_paused", message=f"A {event_type.removeprefix('email.')} event paused the workspace sender."))
+                notified.add(workspace.owner_user_id)
             db.commit()
     return {"ok": True, "suppressed": True}
 
@@ -1813,6 +1823,18 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
             audit(db, campaign, "send_blocked", readiness_error)
             db.commit()
             raise HTTPException(400, readiness_error)
+        if settings.environment == "production":
+            verified_public_email = any(
+                (recipient or "").lower() in str(source.get("content", "")).lower()
+                for source in campaign.research.get("sources", [])
+                if isinstance(source, dict)
+            )
+            if not verified_public_email:
+                campaign.status = "ready"
+                reason = "Recipient email was not found in the researched public company sources."
+                audit(db, campaign, "send_blocked", reason, user.id)
+                db.commit()
+                raise HTTPException(400, reason)
         try:
             provider_message_id = send_email(
                 campaign.recipient_email,

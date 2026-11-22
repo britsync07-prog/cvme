@@ -35,7 +35,8 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
             configured_role = workspace.outreach_target_role or configured_role
             configured_limit = workspace.daily_limit or configured_limit
             configured_timezone = workspace.timezone or configured_timezone
-            workspace_auto_send = bool(getattr(workspace, "outreach_auto_send", workspace_auto_send))
+            if workspace_id:
+                workspace_auto_send = bool(getattr(workspace, "outreach_auto_send", workspace_auto_send))
             if workspace.paused:
                 errors.append("Workspace outreach is paused.")
         elif workspace_id:
@@ -109,7 +110,7 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
             candidate_id = workspace.outreach_candidate_id if workspace_id else settings.outreach_candidate_id
             query = workspace.outreach_query if workspace_id else settings.outreach_query
             target_role = workspace.outreach_target_role if workspace_id else settings.outreach_target_role
-            auto_send = bool(getattr(workspace, "outreach_auto_send", settings.outreach_auto_send))
+            auto_send = bool(getattr(workspace, "outreach_auto_send", settings.outreach_auto_send)) if workspace_id else settings.outreach_auto_send
         response = discover_lead_batch(
             candidate_id=candidate_id,
             query=query,

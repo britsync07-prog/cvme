@@ -1117,6 +1117,29 @@ def admin_force_logout(request: Request, user_id: int):
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.post("/admin/users/{user_id}/delete")
+def admin_delete_user(request: Request, user_id: int):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        target = db.get(User, user_id)
+        if not target or target.id == actor.id:
+            raise HTTPException(400, "That account cannot be deleted from this session.")
+        memberships = db.scalars(select(WorkspaceMembership).where(WorkspaceMembership.user_id == target.id)).all()
+        workspace_ids = [item.workspace_id for item in memberships]
+        for workspace_id in workspace_ids:
+            workspace = db.get(Workspace, workspace_id)
+            if workspace:
+                workspace.deleted_at = utc_now()
+                workspace.paused = True
+        target.is_active = False
+        target.email = f"deleted-{target.id}@invalid.local"
+        target.password_hash = None
+        target.google_sub = None
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="admin_user_deleted", entity_type="user", entity_id=target.id, detail={"workspace_ids": workspace_ids}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.post("/admin/users/{user_id}/reset-password")
 def admin_reset_password(request: Request, user_id: int):
     with SessionLocal() as db:
@@ -1225,6 +1248,19 @@ def admin_add_suppression(request: Request, email: str = Form(""), domain: str =
         actor = _require_admin(request, db)
         db.add(Suppression(workspace_id=None, email=email.strip().lower() or None, domain=domain.strip().lower() or None, reason=reason.strip()[:80] or "admin"))
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="global_suppression_added", entity_type="suppression", detail={"email": bool(email.strip()), "domain": bool(domain.strip())}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/suppression/{suppression_id}/remove")
+def admin_remove_suppression(request: Request, suppression_id: int):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        suppression = db.get(Suppression, suppression_id)
+        if not suppression:
+            raise HTTPException(404, "Suppression entry not found.")
+        db.delete(suppression)
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="global_suppression_removed", entity_type="suppression", entity_id=suppression_id, detail={}, ip_address=request.client.host if request.client else None))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 

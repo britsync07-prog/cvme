@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import secrets
@@ -19,7 +19,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
-from .models import AuditEvent, Campaign, Candidate
+from .models import AuditEvent, Campaign, Candidate, Plan, Subscription, User, Workspace, WorkspaceMembership
+from .security import hash_password, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
     candidates_from_zip,
@@ -58,7 +59,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if (
             settings.admin_username
-            and request.url.path not in {"/healthz", "/login"}
+            and request.url.path not in {"/healthz", "/login", "/signup", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt"}
             and not request.url.path.startswith("/static/")
             and not request.session.get("authenticated")
         ):
@@ -114,8 +115,115 @@ def login_page(request: Request, next: str = "/"):
     return templates.TemplateResponse(request, "login.html", {"next": _safe_next(next), "error": ""})
 
 
+@app.get("/signup")
+def signup_page(request: Request):
+    return templates.TemplateResponse(request, "signup.html", {"error": ""})
+
+
+@app.get("/landing")
+def landing_page(request: Request):
+    return templates.TemplateResponse(request, "landing.html", {})
+
+
+@app.get("/pricing")
+def pricing_page(request: Request):
+    with SessionLocal() as db:
+        plans = db.scalars(select(Plan).where(Plan.active.is_(True)).order_by(Plan.id)).all()
+        if not plans:
+            plans = [
+                Plan(slug="starter", name="Starter", limits={"daily_emails": 25, "cv_profiles": 1}),
+                Plan(slug="pro", name="Pro", limits={"daily_emails": 100, "cv_profiles": 5}),
+                Plan(slug="agency", name="Agency", limits={"daily_emails": 500, "cv_profiles": 25}),
+            ]
+        return templates.TemplateResponse(request, "pricing.html", {"plans": plans})
+
+
+@app.get("/{page_name}")
+def public_information_page(request: Request, page_name: str):
+    pages = {
+        "terms": ("Terms of service", "Use TailorMail responsibly and keep your account credentials secure."),
+        "privacy": ("Privacy policy", "Workspace data is isolated and used to operate the features you configure."),
+        "acceptable-use": ("Acceptable use", "Do not use TailorMail for spam, unlawful profiling, harassment, or deceptive outreach."),
+        "refunds": ("Refund policy", "Subscription refunds are handled according to the plan and billing terms shown at checkout."),
+        "contact": ("Contact", "Contact support through your workspace support channel."),
+    }
+    if page_name not in pages:
+        raise HTTPException(404, "Page not found")
+    title, body = pages[page_name]
+    return templates.TemplateResponse(request, "legal.html", {"title": title, "body": body})
+
+
+@app.get("/robots.txt", include_in_schema=False)
+def robots():
+    return PlainTextResponse("User-agent: *\nAllow: /landing\nAllow: /pricing\n")
+
+
+@app.get("/sitemap.xml", include_in_schema=False)
+def sitemap(request: Request):
+    base = str(request.base_url).rstrip("/")
+    return PlainTextResponse("\n".join(f"{base}/{path}" for path in ("landing", "pricing", "terms", "privacy", "acceptable-use", "refunds", "contact")), media_type="application/xml")
+
+
+@app.post("/signup")
+def signup(
+    request: Request,
+    email: str = Form(),
+    password: str = Form(),
+    terms: bool = Form(False),
+):
+    if not terms:
+        return templates.TemplateResponse(request, "signup.html", {"error": "You must accept the acceptable-use and privacy terms."}, status_code=400)
+    email = email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return templates.TemplateResponse(request, "signup.html", {"error": "Enter a valid email address."}, status_code=400)
+    try:
+        password_hash = hash_password(password)
+    except ValueError as exc:
+        return templates.TemplateResponse(request, "signup.html", {"error": str(exc)}, status_code=400)
+    with SessionLocal() as db:
+        if db.scalar(select(User).where(User.email == email)):
+            return templates.TemplateResponse(request, "signup.html", {"error": "An account with that email already exists."}, status_code=409)
+        user = User(email=email, password_hash=password_hash, role="user", terms_accepted_at=utc_now())
+        db.add(user)
+        db.flush()
+        slug = re.sub(r"[^a-z0-9]+", "-", email.split("@", 1)[0]).strip("-") or "workspace"
+        if db.scalar(select(Workspace).where(Workspace.slug == slug)):
+            slug = f"{slug}-{user.id}"
+        workspace = Workspace(name=f"{email}'s workspace", slug=slug, owner_user_id=user.id)
+        db.add(workspace)
+        db.flush()
+        db.add(WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role="owner"))
+        starter = db.scalar(select(Plan).where(Plan.slug == "starter"))
+        if not starter:
+            starter = Plan(slug="starter", name="Starter", limits={"daily_emails": 25, "cv_profiles": 1})
+            db.add(starter)
+            db.flush()
+        db.add(Subscription(workspace_id=workspace.id, plan_id=starter.id, status="trialing", trial_ends_at=utc_now() + timedelta(days=15)))
+        db.commit()
+        request.session.clear()
+        request.session.update({"authenticated": True, "user_id": user.id, "workspace_id": workspace.id})
+    return RedirectResponse("/", status_code=303)
+
+
 @app.post("/login")
 def login(request: Request, username: str = Form(), password: str = Form(), next: str = Form("/")):
+    email = username.strip().lower()
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.email == email))
+        if user and user.password_hash and user.is_active and not user.locked_until and verify_password(user.password_hash, password):
+            user.failed_login_count = 0
+            user.last_login_at = utc_now()
+            membership = db.scalar(select(WorkspaceMembership).where(WorkspaceMembership.user_id == user.id).order_by(WorkspaceMembership.created_at))
+            if membership:
+                db.commit()
+                request.session.clear()
+                request.session.update({"authenticated": True, "user_id": user.id, "workspace_id": membership.workspace_id})
+                return RedirectResponse(_safe_next(next), status_code=303)
+        if user and user.password_hash and user.is_active:
+            user.failed_login_count += 1
+            if user.failed_login_count >= 5:
+                user.locked_until = utc_now() + timedelta(minutes=15)
+            db.commit()
     if settings.admin_username and secrets.compare_digest(username, settings.admin_username) and secrets.compare_digest(password, settings.admin_password):
         with SessionLocal() as db:
             workspace, user = ensure_default_workspace(db)
@@ -131,6 +239,28 @@ def login(request: Request, username: str = Form(), password: str = Form(), next
         {"next": _safe_next(next), "error": "Incorrect username or password."},
         status_code=401,
     )
+
+
+@app.get("/account/export")
+def export_account(request: Request):
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        candidates = db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace))).all()
+        campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace))).all()
+        return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns]})
+
+
+@app.post("/account/delete")
+def delete_account(request: Request):
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        workspace.deleted_at = utc_now()
+        user.is_active = False
+        db.execute(update(Candidate).where(workspace_filter(Candidate, workspace)).values(deleted_at=utc_now()))
+        db.execute(update(Campaign).where(workspace_filter(Campaign, workspace)).values(deleted_at=utc_now()))
+        db.commit()
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
 
 
 @app.post("/logout")

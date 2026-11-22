@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Create account · TailorMail</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-page">
+  <main class="login-card" aria-labelledby="signup-title">
+    <div class="logo-mark" aria-hidden="true">TM</div>
+    <p class="eyebrow">TailorMail</p>
+    <h1 id="signup-title">Start your outreach workspace</h1>
+    <p class="login-copy">Create a 15-day trial workspace. You can connect your own AI and Gmail later.</p>
+    {% if error %}<p class="login-error" role="alert">{{ error }}</p>{% endif %}
+    <form method="post" action="/signup" class="login-form">
+      <label>Email<input name="email" type="email" autocomplete="email" required autofocus></label>
+      <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
+      <label class="checkbox-row"><input name="terms" type="checkbox" required> I accept the privacy terms and acceptable-use policy.</label>
+      <button type="submit">Create workspace</button>
+    </form>
+    <p class="login-copy">Already registered? <a href="/login">Sign in</a></p>
+  </main>
+</body>
+</html>

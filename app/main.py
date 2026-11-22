@@ -23,7 +23,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, BillingEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, BillingEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, Suppression, User, Workspace, WorkspaceMembership
 from .security import encrypt_secret, hash_password, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
@@ -63,7 +63,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if (
             settings.admin_username
-            and request.url.path not in {"/healthz", "/login", "/signup", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt"}
+            and request.url.path not in {"/healthz", "/login", "/signup", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/sitemap.xml", "/robots.txt", "/unsubscribe"}
             and not request.url.path.startswith("/static/")
             and not request.session.get("authenticated")
         ):
@@ -312,6 +312,17 @@ def delete_account(request: Request):
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
+
+
+@app.get("/unsubscribe")
+def unsubscribe(email: str, workspace_id: int | None = None):
+    normalized = email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+        raise HTTPException(400, "A valid email address is required.")
+    with SessionLocal() as db:
+        db.add(Suppression(workspace_id=workspace_id, email=normalized, reason="unsubscribe"))
+        db.commit()
+    return PlainTextResponse("You have been unsubscribed.")
 
 
 def audit(db, campaign: Campaign, action: str, detail: str, user_id: int | None = None) -> None:
@@ -634,6 +645,11 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
     with SessionLocal() as db:
         workspace, user = current_workspace(request, db)
         require_send_slot(db, workspace)
+        recipient = campaign_recipient = db.scalar(select(Campaign.recipient_email).where(Campaign.id == campaign_id, Campaign.workspace_id == workspace.id))
+        recipient_domain = recipient.rsplit("@", 1)[-1].lower() if recipient and "@" in recipient else ""
+        suppressed = db.scalar(select(Suppression).where(Suppression.email == (recipient or "").lower())) or db.scalar(select(Suppression).where(Suppression.domain == recipient_domain, Suppression.workspace_id.is_(None)))
+        if suppressed:
+            raise HTTPException(400, "This recipient is suppressed and cannot be contacted.")
         claimed = db.execute(
             update(Campaign)
             .where(Campaign.id == campaign_id, Campaign.status == "ready", workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))
@@ -653,7 +669,7 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
             provider_message_id = send_email(
                 campaign.recipient_email,
                 campaign.email_subject,
-                campaign.email_body,
+                campaign.email_body.rstrip() + "\n\nIf you prefer not to receive application emails, reply with 'unsubscribe'.",
                 Path(campaign.artifact_path),
                 email_account=db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id)),
             )

@@ -255,3 +255,13 @@ class Notification(Base):
     message: Mapped[str] = mapped_column(Text)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class Suppression(Base):
+    __tablename__ = "suppressions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int | None] = mapped_column(ForeignKey("workspaces.id"), nullable=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
+    domain: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    reason: Mapped[str] = mapped_column(String(80), default="unsubscribe")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

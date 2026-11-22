@@ -535,6 +535,26 @@ def send_email(recipient: str, subject: str, body: str, attachment: Path, email_
     sender_from = settings.smtp_from
     sender_tls = settings.smtp_use_tls
     if email_account is not None:
+        if email_account.provider == "gmail":
+            credentials = json.loads(decrypt_secret(email_account.encrypted_credentials))
+            access_token = credentials.get("access_token", "")
+            if credentials.get("refresh_token") and credentials.get("expires_at", 0) <= int(datetime.now(timezone.utc).timestamp()) + 30:
+                response = httpx.post("https://oauth2.googleapis.com/token", data={"client_id": settings.google_client_id, "client_secret": settings.google_client_secret, "refresh_token": credentials["refresh_token"], "grant_type": "refresh_token"}, timeout=30)
+                response.raise_for_status()
+                token = response.json()
+                access_token = token["access_token"]
+            if not access_token:
+                raise RuntimeError("Gmail authorization has expired. Reconnect Gmail.")
+            message = EmailMessage()
+            message["From"] = email_account.email
+            message["To"] = recipient
+            message["Subject"] = subject
+            message.set_content(body)
+            message.add_attachment(attachment.read_bytes(), maintype="application", subtype="pdf", filename=attachment.name)
+            raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+            response = httpx.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", headers={"Authorization": f"Bearer {access_token}"}, json={"raw": raw}, timeout=30)
+            response.raise_for_status()
+            return response.json().get("id")
         if email_account.provider != "smtp":
             raise RuntimeError("This email account provider is not enabled yet.")
         credentials = json.loads(decrypt_secret(email_account.encrypted_credentials))

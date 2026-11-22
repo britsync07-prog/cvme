@@ -6,7 +6,7 @@ import re
 import secrets
 import hashlib
 import hmac
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -23,7 +23,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, BillingEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, Suppression, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, Suppression, User, Workspace, WorkspaceMembership
 from .security import encrypt_secret, hash_password, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
@@ -367,6 +367,25 @@ def dashboard(request: Request, tab: str = "applications"):
                 "active_tab": tab,
                 "settings": settings,
                 "subscription_status": subscription_status,
+            },
+        )
+
+
+@app.get("/admin")
+def admin_dashboard(request: Request):
+    with SessionLocal() as db:
+        _, user = current_workspace(request, db)
+        if user.role not in {"admin", "superadmin"}:
+            raise HTTPException(403, "Administrator access required.")
+        return templates.TemplateResponse(
+            request,
+            "admin.html",
+            {
+                "users": db.scalars(select(User).order_by(User.created_at.desc())).all(),
+                "workspaces": db.scalars(select(Workspace).where(Workspace.deleted_at.is_(None)).order_by(Workspace.created_at.desc())).all(),
+                "campaign_count": db.scalar(select(func.count(Campaign.id))) or 0,
+                "sent_count": db.scalar(select(func.count(Campaign.id)).where(Campaign.status == "sent")) or 0,
+                "audit_count": db.scalar(select(func.count(AuditLog.id))) or 0,
             },
         )
 
@@ -817,6 +836,46 @@ def save_email_account(
             account.email = email.strip()
             account.provider = "smtp"
             account.encrypted_credentials = encrypt_secret(payload)
+            account.status = "active"
+        db.commit()
+    return RedirectResponse("/?tab=settings", status_code=303)
+
+
+@app.get("/settings/gmail/connect")
+def gmail_connect(request: Request):
+    if not settings.google_client_id or not settings.google_redirect_uri:
+        raise HTTPException(503, "Google OAuth is not configured.")
+    state = secrets.token_urlsafe(32)
+    request.session["gmail_oauth_state"] = state
+    params = urlencode({"client_id": settings.google_client_id, "redirect_uri": settings.google_redirect_uri, "response_type": "code", "access_type": "offline", "prompt": "consent", "scope": "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email", "state": state})
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+
+
+@app.get("/settings/gmail/callback")
+def gmail_callback(request: Request, code: str = "", state: str = ""):
+    if not code or not state or not secrets.compare_digest(state, request.session.pop("gmail_oauth_state", "")):
+        raise HTTPException(400, "Invalid Gmail authorization state.")
+    if not settings.google_client_id or not settings.google_client_secret:
+        raise HTTPException(503, "Google OAuth is not configured.")
+    token_response = httpx.post("https://oauth2.googleapis.com/token", data={"code": code, "client_id": settings.google_client_id, "client_secret": settings.google_client_secret, "redirect_uri": settings.google_redirect_uri, "grant_type": "authorization_code"}, timeout=30)
+    token_response.raise_for_status()
+    token = token_response.json()
+    profile = httpx.get("https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {token['access_token']}"}, timeout=30)
+    profile.raise_for_status()
+    email = profile.json().get("email")
+    if not email:
+        raise HTTPException(400, "Google did not return a sender email.")
+    credentials = {"access_token": token.get("access_token", ""), "refresh_token": token.get("refresh_token", ""), "expires_at": int(datetime.now(timezone.utc).timestamp()) + int(token.get("expires_in", 3600))}
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id).order_by(EmailAccount.id))
+        if not account:
+            account = EmailAccount(workspace_id=workspace.id, provider="gmail", email=email, encrypted_credentials=encrypt_secret(json.dumps(credentials)))
+            db.add(account)
+        else:
+            account.provider = "gmail"
+            account.email = email
+            account.encrypted_credentials = encrypt_secret(json.dumps(credentials))
             account.status = "active"
         db.commit()
     return RedirectResponse("/?tab=settings", status_code=303)

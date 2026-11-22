@@ -4,7 +4,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy import select, update
 
 from .config import settings
-from .models import AuditEvent, Campaign, Candidate, User, Workspace, WorkspaceMembership
+from .models import AuditEvent, Campaign, Candidate, Plan, Subscription, User, Workspace, WorkspaceMembership
 
 
 def _legacy_email() -> str:
@@ -30,7 +30,24 @@ def ensure_default_workspace(db) -> tuple[Workspace, User]:
         )
     ):
         db.add(WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role="owner"))
+    ensure_default_plans(db)
+    if not db.scalar(select(Subscription).where(Subscription.workspace_id == workspace.id)):
+        plan = db.scalar(select(Plan).where(Plan.slug == "owner"))
+        db.add(Subscription(workspace_id=workspace.id, plan_id=plan.id, status="active"))
     return workspace, user
+
+
+def ensure_default_plans(db) -> None:
+    defaults = {
+        "owner": ("Owner", {"daily_emails": 100, "cv_profiles": 100}, 0, 0),
+        "starter": ("Starter", {"daily_emails": 25, "cv_profiles": 1}, 1900, 19000),
+        "pro": ("Pro", {"daily_emails": 100, "cv_profiles": 5, "analytics": True}, 4900, 49000),
+        "agency": ("Agency", {"daily_emails": 500, "cv_profiles": 25, "team_seats": 10}, 14900, 149000),
+    }
+    for slug, (name, limits, monthly, yearly) in defaults.items():
+        if not db.scalar(select(Plan).where(Plan.slug == slug)):
+            db.add(Plan(slug=slug, name=name, limits=limits, monthly_price_cents=monthly, yearly_price_cents=yearly))
+    db.flush()
 
 
 def backfill_legacy_rows(db) -> tuple[Workspace, User]:

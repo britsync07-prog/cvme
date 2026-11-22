@@ -1,8 +1,11 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import json
 import re
 import secrets
+import hashlib
+import hmac
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -19,9 +22,10 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
-from .models import AIProviderConfig, AuditEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, User, Workspace, WorkspaceMembership
+from .entitlements import require_candidate_slot, require_send_slot, status_for
+from .models import AIProviderConfig, AuditEvent, BillingEvent, Campaign, Candidate, EmailAccount, Plan, Subscription, User, Workspace, WorkspaceMembership
 from .security import encrypt_secret, hash_password, utc_now, verify_password
-from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_workspace, require_owned, workspace_filter
+from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
     candidates_from_zip,
     cv_outreach_readiness_error,
@@ -193,11 +197,8 @@ def signup(
         db.add(workspace)
         db.flush()
         db.add(WorkspaceMembership(workspace_id=workspace.id, user_id=user.id, role="owner"))
+        ensure_default_plans(db)
         starter = db.scalar(select(Plan).where(Plan.slug == "starter"))
-        if not starter:
-            starter = Plan(slug="starter", name="Starter", limits={"daily_emails": 25, "cv_profiles": 1})
-            db.add(starter)
-            db.flush()
         db.add(Subscription(workspace_id=workspace.id, plan_id=starter.id, status="trialing", trial_ends_at=utc_now() + timedelta(days=15)))
         db.commit()
         request.session.clear()
@@ -247,7 +248,51 @@ def export_account(request: Request):
         workspace, user = current_workspace(request, db)
         candidates = db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace))).all()
         campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace))).all()
-        return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns]})
+    return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns]})
+
+
+@app.post("/billing/webhook", include_in_schema=False)
+async def billing_webhook(request: Request):
+    if not settings.stripe_webhook_secret:
+        raise HTTPException(503, "Stripe webhooks are not configured.")
+    body = await request.body()
+    signature = request.headers.get("stripe-signature", "")
+    parts = {part.split("=", 1)[0]: part.split("=", 1)[1] for part in signature.split(",") if "=" in part}
+    timestamp = parts.get("t")
+    provided = parts.get("v1")
+    if not timestamp or not provided:
+        raise HTTPException(400, "Invalid Stripe signature.")
+    signed = f"{timestamp}.{body.decode('utf-8')}".encode("utf-8")
+    expected = hmac.new(settings.stripe_webhook_secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, provided):
+        raise HTTPException(400, "Invalid Stripe signature.")
+    try:
+        event = json.loads(body)
+        event_id = event["id"]
+        event_type = event["type"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(400, "Invalid Stripe event.") from exc
+    with SessionLocal() as db:
+        if db.scalar(select(BillingEvent).where(BillingEvent.provider_event_id == event_id)):
+            return {"ok": True, "duplicate": True}
+        db.add(BillingEvent(provider_event_id=event_id, event_type=event_type, payload=event))
+        data = event.get("data", {}).get("object", {})
+        workspace_id = data.get("metadata", {}).get("workspace_id")
+        subscription = db.scalar(select(Subscription).where(Subscription.workspace_id == int(workspace_id))) if workspace_id else None
+        if subscription:
+            if event_type in {"customer.subscription.created", "customer.subscription.updated"}:
+                subscription.status = data.get("status", subscription.status)
+                subscription.provider_customer_id = data.get("customer") or subscription.provider_customer_id
+                subscription.provider_subscription_id = data.get("id") or subscription.provider_subscription_id
+            elif event_type == "customer.subscription.deleted":
+                subscription.status = "canceled"
+            elif event_type == "invoice.payment_failed":
+                subscription.status = "past_due"
+                subscription.grace_ends_at = utc_now() + timedelta(days=7)
+            elif event_type == "invoice.paid":
+                subscription.status = "active"
+        db.commit()
+    return {"ok": True}
 
 
 @app.post("/account/delete")
@@ -298,6 +343,7 @@ def dashboard(request: Request, tab: str = "applications"):
             daily_remaining = remaining_daily_send_budget(db, workspace.id)
         except ValueError:
             daily_remaining = 0
+        subscription_status = status_for(db, workspace)
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -309,6 +355,7 @@ def dashboard(request: Request, tab: str = "applications"):
                 "daily_remaining": daily_remaining,
                 "active_tab": tab,
                 "settings": settings,
+                "subscription_status": subscription_status,
             },
         )
 
@@ -319,6 +366,7 @@ def create_candidate(request: Request = None, name: str = Form(), email: str = F
         raise HTTPException(400, "Candidate consent is required before processing their CV.")
     with SessionLocal() as db:
         workspace, user = current_workspace(request, db) if request else ensure_default_workspace(db)
+        require_candidate_slot(db, workspace)
         candidate = Candidate(workspace_id=workspace.id, user_id=user.id, name=name.strip(), email=email.strip(), cv_yaml=cv_yaml)
         db.add(candidate)
         db.commit()
@@ -335,6 +383,7 @@ async def import_candidates(request: Request = None, archive: UploadFile = File(
         raise HTTPException(400, str(exc)) from exc
     with SessionLocal() as db:
         workspace, user = current_workspace(request, db) if request else ensure_default_workspace(db)
+        require_candidate_slot(db, workspace, len(records))
         db.add_all([Candidate(workspace_id=workspace.id, user_id=user.id, name=name, email=email, cv_yaml=cv_yaml) for name, email, cv_yaml in records])
         db.commit()
     return RedirectResponse("/?tab=candidates", status_code=303)
@@ -584,6 +633,7 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
         raise HTTPException(400, "Explicit approval is required to send.")
     with SessionLocal() as db:
         workspace, user = current_workspace(request, db)
+        require_send_slot(db, workspace)
         claimed = db.execute(
             update(Campaign)
             .where(Campaign.id == campaign_id, Campaign.status == "ready", workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))

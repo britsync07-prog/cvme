@@ -119,6 +119,10 @@ class Plan(Base):
     slug: Mapped[str] = mapped_column(String(80), unique=True)
     name: Mapped[str] = mapped_column(String(120))
     limits: Mapped[dict] = mapped_column(JSON, default=dict)
+    monthly_price_cents: Mapped[int] = mapped_column(Integer, default=0)
+    yearly_price_cents: Mapped[int] = mapped_column(Integer, default=0)
+    stripe_monthly_price_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_yearly_price_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -131,9 +135,20 @@ class Subscription(Base):
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     provider_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    grace_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     workspace: Mapped[Workspace] = relationship(back_populates="subscriptions")
     plan: Mapped[Plan | None] = relationship()
+
+
+class BillingEvent(Base):
+    __tablename__ = "billing_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_event_id: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(100))
+    payload: Mapped[dict] = mapped_column(JSON)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class Invoice(Base):

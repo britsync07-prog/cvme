@@ -41,6 +41,7 @@
   </nav>
 
   <main class="main-content">
+    {% if subscription_status and subscription_status.trial_active %}<div class="panel trial-banner"><strong>{{ subscription_status.trial_days_left }} trial days remaining.</strong> Upgrade before your trial ends to keep sending.</div>{% elif subscription_status and not subscription_status.active %}<div class="panel login-error"><strong>Sending is paused.</strong> Your trial or subscription is inactive.</div>{% endif %}
     {% if active_tab == 'applications' %}
     <!-- APPLICATIONS TAB -->
     <div class="dashboard-title">

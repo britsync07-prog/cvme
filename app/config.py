@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     outreach_target_role: str = ""
     outreach_auto_send: bool = False
     outreach_timezone: str = "Asia/Dhaka"
+    trial_days: int = 15
+    trial_card_required: bool = False
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_publishable_key: str = ""
+    redis_url: str = "redis://redis:6379/0"
+    signup_enabled: bool = True
 
 
 settings = Settings()

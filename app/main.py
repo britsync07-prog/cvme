@@ -20,6 +20,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .models import AuditEvent, Campaign, Candidate
+from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
     candidates_from_zip,
     cv_outreach_readiness_error,
@@ -39,6 +40,8 @@ async def lifespan(app: FastAPI):
     Path("data").mkdir(exist_ok=True)
     settings.artifact_dir.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(engine)
+    with SessionLocal() as db:
+        backfill_legacy_rows(db)
     yield
 
 
@@ -114,8 +117,13 @@ def login_page(request: Request, next: str = "/"):
 @app.post("/login")
 def login(request: Request, username: str = Form(), password: str = Form(), next: str = Form("/")):
     if settings.admin_username and secrets.compare_digest(username, settings.admin_username) and secrets.compare_digest(password, settings.admin_password):
+        with SessionLocal() as db:
+            workspace, user = ensure_default_workspace(db)
+            db.commit()
         request.session.clear()
         request.session["authenticated"] = True
+        request.session["workspace_id"] = workspace.id
+        request.session["user_id"] = user.id
         return RedirectResponse(_safe_next(next), status_code=303)
     return templates.TemplateResponse(
         request,
@@ -131,29 +139,33 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
-def audit(db, campaign: Campaign, action: str, detail: str) -> None:
-    db.add(AuditEvent(campaign_id=campaign.id, action=action, detail=detail))
+def audit(db, campaign: Campaign, action: str, detail: str, user_id: int | None = None) -> None:
+    db.add(AuditEvent(campaign_id=campaign.id, workspace_id=campaign.workspace_id, user_id=user_id or campaign.user_id, action=action, detail=detail))
 
 
-def remaining_daily_send_budget(db) -> int:
+def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
     try:
         local_timezone = ZoneInfo(settings.outreach_timezone)
     except ZoneInfoNotFoundError as exc:
         raise ValueError("OUTREACH_TIMEZONE must be a valid IANA timezone.") from exc
     now = datetime.now(local_timezone)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-    sent_today = db.scalar(select(func.count(Campaign.id)).where(Campaign.status == "sent", Campaign.sent_at >= start)) or 0
+    filters = [Campaign.status == "sent", Campaign.sent_at >= start]
+    if workspace_id is not None:
+        filters.append(Campaign.workspace_id == workspace_id)
+    sent_today = db.scalar(select(func.count(Campaign.id)).where(*filters)) or 0
     return max(settings.outreach_daily_limit - sent_today, 0)
 
 
 @app.get("/")
 def dashboard(request: Request, tab: str = "applications"):
     with SessionLocal() as db:
-        campaigns = db.scalars(select(Campaign).order_by(Campaign.created_at.desc())).all()
-        candidates = db.scalars(select(Candidate).order_by(Candidate.name)).all()
-        counts = dict(db.execute(select(Campaign.status, func.count(Campaign.id)).group_by(Campaign.status)).all())
+        workspace, _ = current_workspace(request, db)
+        campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)).order_by(Campaign.created_at.desc())).all()
+        candidates = db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace), Candidate.deleted_at.is_(None)).order_by(Candidate.name)).all()
+        counts = dict(db.execute(select(Campaign.status, func.count(Campaign.id)).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)).group_by(Campaign.status)).all())
         try:
-            daily_remaining = remaining_daily_send_budget(db)
+            daily_remaining = remaining_daily_send_budget(db, workspace.id)
         except ValueError:
             daily_remaining = 0
         return templates.TemplateResponse(
@@ -172,18 +184,19 @@ def dashboard(request: Request, tab: str = "applications"):
 
 
 @app.post("/candidates")
-def create_candidate(name: str = Form(), email: str = Form(), cv_yaml: str = Form(), consent: bool = Form(False)):
+def create_candidate(request: Request = None, name: str = Form(), email: str = Form(), cv_yaml: str = Form(), consent: bool = Form(False)):
     if not consent:
         raise HTTPException(400, "Candidate consent is required before processing their CV.")
     with SessionLocal() as db:
-        candidate = Candidate(name=name.strip(), email=email.strip(), cv_yaml=cv_yaml)
+        workspace, user = current_workspace(request, db) if request else ensure_default_workspace(db)
+        candidate = Candidate(workspace_id=workspace.id, user_id=user.id, name=name.strip(), email=email.strip(), cv_yaml=cv_yaml)
         db.add(candidate)
         db.commit()
     return RedirectResponse("/?tab=candidates", status_code=303)
 
 
 @app.post("/candidates/import")
-async def import_candidates(archive: UploadFile = File(), consent: bool = Form(False)):
+async def import_candidates(request: Request = None, archive: UploadFile = File(), consent: bool = Form(False)):
     if not consent:
         raise HTTPException(400, "Candidate consent is required before processing CVs.")
     try:
@@ -191,17 +204,17 @@ async def import_candidates(archive: UploadFile = File(), consent: bool = Form(F
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     with SessionLocal() as db:
-        db.add_all([Candidate(name=name, email=email, cv_yaml=cv_yaml) for name, email, cv_yaml in records])
+        workspace, user = current_workspace(request, db) if request else ensure_default_workspace(db)
+        db.add_all([Candidate(workspace_id=workspace.id, user_id=user.id, name=name, email=email, cv_yaml=cv_yaml) for name, email, cv_yaml in records])
         db.commit()
     return RedirectResponse("/?tab=candidates", status_code=303)
 
 
 @app.get("/candidates/{candidate_id}")
-def get_candidate(candidate_id: int):
+def get_candidate(request: Request, candidate_id: int):
     with SessionLocal() as db:
-        candidate = db.get(Candidate, candidate_id)
-        if not candidate:
-            raise HTTPException(404, "Candidate not found")
+        workspace, _ = current_workspace(request, db)
+        candidate = require_owned(db, Candidate, candidate_id, workspace)
         return {
             "id": candidate.id,
             "name": candidate.name,
@@ -212,18 +225,18 @@ def get_candidate(candidate_id: int):
 
 
 @app.post("/candidates/{candidate_id}/delete")
-def delete_candidate(candidate_id: int):
+def delete_candidate(request: Request, candidate_id: int):
     with SessionLocal() as db:
-        candidate = db.get(Candidate, candidate_id)
-        if not candidate:
-            raise HTTPException(404, "Candidate not found")
-        db.delete(candidate)
+        workspace, _ = current_workspace(request, db)
+        candidate = require_owned(db, Candidate, candidate_id, workspace)
+        candidate.deleted_at = datetime.now(timezone.utc)
         db.commit()
     return RedirectResponse("/?tab=candidates", status_code=303)
 
 
 @app.post("/campaigns")
 def create_campaign(
+    request: Request = None,
     candidate_id: int = Form(),
     company_name: str = Form(),
     company_url: str = Form(""),
@@ -233,10 +246,11 @@ def create_campaign(
     auto_prepare: bool = Form(False),
 ):
     with SessionLocal() as db:
-        candidate = db.get(Candidate, candidate_id)
-        if not candidate:
-            raise HTTPException(404, "Candidate not found")
+        workspace, user = current_workspace(request, db) if request else ensure_default_workspace(db)
+        candidate = require_owned(db, Candidate, candidate_id, workspace)
         campaign = Campaign(
+            workspace_id=workspace.id,
+            user_id=user.id,
             candidate_id=candidate_id,
             company_name=company_name.strip(),
             company_url=company_url.strip() or None,
@@ -252,16 +266,16 @@ def create_campaign(
         campaign_id = campaign.id
 
     if auto_prepare:
-        return prepare_campaign(campaign_id)
+        return prepare_campaign(campaign_id, request=request)
 
     return RedirectResponse(f"/campaigns/{campaign_id}", status_code=303)
 
 
 @app.post("/leads/discover")
-def discover_lead(candidate_id: int = Form(), query: str = Form(), target_role: str = Form("")):
+def discover_lead(request: Request = None, candidate_id: int = Form(), query: str = Form(), target_role: str = Form("")):
     with SessionLocal() as db:
-        if not db.get(Candidate, candidate_id):
-            raise HTTPException(404, "Candidate not found")
+        workspace, _ = current_workspace(request, db) if request else ensure_default_workspace(db)
+        require_owned(db, Candidate, candidate_id, workspace)
     try:
         lead = discover_company_lead(query.strip())
     except (httpx.HTTPError, ValueError) as exc:
@@ -274,11 +288,13 @@ def discover_lead(candidate_id: int = Form(), query: str = Form(), target_role: 
         job_description=f"Companies House number: {lead['company_number']}. Public contact sources: {', '.join(lead['source_urls'])}",
         recipient_email=lead["recipient_email"],
         auto_prepare=True,
+        request=request,
     )
 
 
 @app.post("/leads/batch")
 def discover_lead_batch(
+    request: Request = None,
     candidate_id: int = Form(),
     query: str = Form(),
     target_role: str = Form(""),
@@ -287,16 +303,16 @@ def discover_lead_batch(
 ):
     limit = min(max(limit, 1), 100)
     with SessionLocal() as db:
-        if not db.get(Candidate, candidate_id):
-            raise HTTPException(404, "Candidate not found")
-        existing_names = {name.casefold() for name in db.scalars(select(Campaign.company_name)).all()}
+        workspace, _ = current_workspace(request, db) if request else ensure_default_workspace(db)
+        require_owned(db, Candidate, candidate_id, workspace)
+        existing_names = {name.casefold() for name in db.scalars(select(Campaign.company_name).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))).all()}
         existing_numbers = {
-            number for description in db.scalars(select(Campaign.job_description)).all()
+            number for description in db.scalars(select(Campaign.job_description).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))).all()
             for number in re.findall(r"Companies House number: ([A-Z0-9]+)", description or "")
         }
         if send_when_ready:
             try:
-                limit = min(limit, remaining_daily_send_budget(db))
+                limit = min(limit, remaining_daily_send_budget(db, workspace.id))
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
     if limit == 0:
@@ -317,10 +333,11 @@ def discover_lead_batch(
                 job_description=f"Companies House number: {lead['company_number']}. Public contact sources: {', '.join(lead['source_urls'])}",
                 recipient_email=lead["recipient_email"],
                 auto_prepare=True,
+                request=request,
             )
             if send_when_ready:
                 campaign_id = int(response.headers["location"].rsplit("/", 1)[-1])
-                send_campaign(campaign_id, approved=True)
+                send_campaign(campaign_id, approved=True, request=request)
             completed += 1
         except HTTPException:
             continue
@@ -330,9 +347,8 @@ def discover_lead_batch(
 @app.get("/campaigns/{campaign_id}")
 def campaign_detail(request: Request, campaign_id: int):
     with SessionLocal() as db:
-        campaign = db.get(Campaign, campaign_id)
-        if not campaign:
-            raise HTTPException(404, "Campaign not found")
+        workspace, _ = current_workspace(request, db)
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
         return templates.TemplateResponse(
             request,
             "campaign.html",
@@ -346,11 +362,10 @@ def campaign_detail(request: Request, campaign_id: int):
 
 
 @app.post("/campaigns/{campaign_id}/prepare")
-def prepare_campaign(campaign_id: int):
+def prepare_campaign(campaign_id: int, request: Request = None):
     with SessionLocal() as db:
-        campaign = db.get(Campaign, campaign_id)
-        if not campaign:
-            raise HTTPException(404, "Campaign not found")
+        workspace, _ = current_workspace(request, db) if request else ensure_default_workspace(db)
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
         try:
             campaign.status = "researching"
             db.commit()
@@ -387,28 +402,29 @@ def prepare_campaign(campaign_id: int):
 
 @app.post("/campaigns/{campaign_id}/update-email")
 def update_campaign_email(
+    request: Request,
     campaign_id: int,
     email_subject: str = Form(),
     email_body: str = Form(),
 ):
     with SessionLocal() as db:
-        campaign = db.get(Campaign, campaign_id)
-        if not campaign:
-            raise HTTPException(404, "Campaign not found")
+        workspace, user = current_workspace(request, db)
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
         if campaign.status not in {"ready", "failed"}:
             raise HTTPException(400, "Cannot edit email of sent or processing campaign")
         campaign.email_subject = email_subject.strip()
         campaign.email_body = email_body.strip()
-        audit(db, campaign, "email_edited", "Application email subject and body updated by user.")
+        audit(db, campaign, "email_edited", "Application email subject and body updated by user.", user.id)
         db.commit()
     return RedirectResponse(f"/campaigns/{campaign_id}", status_code=303)
 
 
 @app.get("/campaigns/{campaign_id}/cv.pdf")
-def download_pdf(campaign_id: int):
+def download_pdf(request: Request, campaign_id: int):
     with SessionLocal() as db:
-        campaign = db.get(Campaign, campaign_id)
-        if not campaign or not campaign.artifact_path or not Path(campaign.artifact_path).is_file():
+        workspace, _ = current_workspace(request, db)
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
+        if not campaign.artifact_path or not Path(campaign.artifact_path).is_file():
             raise HTTPException(404, "PDF not found")
         return FileResponse(
             campaign.artifact_path,
@@ -418,10 +434,11 @@ def download_pdf(campaign_id: int):
 
 
 @app.get("/campaigns/{campaign_id}/preview.pdf")
-def preview_pdf(campaign_id: int):
+def preview_pdf(request: Request, campaign_id: int):
     with SessionLocal() as db:
-        campaign = db.get(Campaign, campaign_id)
-        if not campaign or not campaign.artifact_path or not Path(campaign.artifact_path).is_file():
+        workspace, _ = current_workspace(request, db)
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
+        if not campaign.artifact_path or not Path(campaign.artifact_path).is_file():
             raise HTTPException(404, "PDF not found")
         return FileResponse(
             campaign.artifact_path,
@@ -431,19 +448,20 @@ def preview_pdf(campaign_id: int):
 
 
 @app.post("/campaigns/{campaign_id}/send")
-def send_campaign(campaign_id: int, approved: bool = Form(False)):
+def send_campaign(campaign_id: int, approved: bool = Form(False), request: Request = None):
     if not approved:
         raise HTTPException(400, "Explicit approval is required to send.")
     with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
         claimed = db.execute(
             update(Campaign)
-            .where(Campaign.id == campaign_id, Campaign.status == "ready")
+            .where(Campaign.id == campaign_id, Campaign.status == "ready", workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))
             .values(status="sending")
         )
         if claimed.rowcount != 1:
             raise HTTPException(400, "Only a ready campaign can be sent.")
         db.commit()
-        campaign = db.get(Campaign, campaign_id)
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
         readiness_error = cv_outreach_readiness_error(campaign.candidate.cv_yaml)
         if readiness_error:
             campaign.status = "ready"
@@ -462,7 +480,7 @@ def send_campaign(campaign_id: int, approved: bool = Form(False)):
             detail = f"One email sent to {campaign.recipient_email}."
             if provider_message_id:
                 detail += f" Provider message ID: {provider_message_id}."
-            audit(db, campaign, "sent", detail)
+            audit(db, campaign, "sent", detail, user.id)
             db.commit()
         except Exception as exc:
             campaign.status = "send_uncertain"
@@ -476,12 +494,11 @@ def send_campaign(campaign_id: int, approved: bool = Form(False)):
 
 
 @app.post("/campaigns/{campaign_id}/delete")
-def delete_campaign(campaign_id: int):
+def delete_campaign(request: Request, campaign_id: int):
     with SessionLocal() as db:
-        campaign = db.get(Campaign, campaign_id)
-        if not campaign:
-            raise HTTPException(404, "Campaign not found")
-        db.delete(campaign)
+        workspace, _ = current_workspace(request, db)
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
+        campaign.deleted_at = datetime.now(timezone.utc)
         db.commit()
     return RedirectResponse("/?tab=applications", status_code=303)
 

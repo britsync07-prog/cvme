@@ -2,12 +2,14 @@
 
 import json
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from sqlalchemy import select
 
 from .config import settings
 from .db import SessionLocal
 from .main import discover_lead_batch, remaining_daily_send_budget
 from .models import Candidate
 from .services import cv_outreach_readiness_error
+from .tenancy import ensure_default_workspace
 
 
 def production_preflight_errors() -> list[str]:
@@ -32,7 +34,14 @@ def production_preflight_errors() -> list[str]:
         errors.append("OUTREACH_TIMEZONE must be a valid IANA timezone.")
     if settings.outreach_candidate_id:
         with SessionLocal() as db:
-            candidate = db.get(Candidate, settings.outreach_candidate_id)
+            workspace, _ = ensure_default_workspace(db)
+            candidate = db.scalar(
+                select(Candidate).where(
+                    Candidate.id == settings.outreach_candidate_id,
+                    Candidate.workspace_id == workspace.id,
+                    Candidate.deleted_at.is_(None),
+                )
+            )
             if not candidate:
                 errors.append("Configured outreach candidate was not found.")
             else:

@@ -1,0 +1,2 @@
+Run `alembic upgrade head` before starting production. Existing records are
+assigned to the owner workspace by the application bootstrap/backfill step.

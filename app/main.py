@@ -29,7 +29,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_feature, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, OutreachJob, PasswordResetToken, Payment, Plan, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, Coupon, EmailAccount, EmailVerificationToken, Invoice, Notification, OutreachJob, PasswordResetToken, Payment, Plan, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
 from .ops import enqueue_job, kill_switch_enabled, mark_job, set_setting, setting_value
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
@@ -653,7 +653,7 @@ def billing_page(request: Request, success: int = 0):
 
 
 @app.post("/billing/checkout")
-def billing_checkout(request: Request, plan_slug: str = Form(), interval: str = Form("monthly")):
+def billing_checkout(request: Request, plan_slug: str = Form(), interval: str = Form("monthly"), coupon_code: str = Form("")):
     if not settings.stripe_secret_key:
         raise HTTPException(503, "Stripe billing is not configured.")
     if interval not in {"monthly", "yearly"}:
@@ -667,9 +667,21 @@ def billing_checkout(request: Request, plan_slug: str = Form(), interval: str = 
         if not price:
             raise HTTPException(503, "This plan has no Stripe price configured yet.")
         data = {"mode": "subscription", "success_url": f"{settings.base_url}/billing?success=1", "cancel_url": f"{settings.base_url}/billing", "line_items[0][price]": price, "line_items[0][quantity]": "1", "customer_email": user.email, "metadata[workspace_id]": str(workspace.id), "subscription_data[metadata][workspace_id]": str(workspace.id)}
+        coupon = None
+        if coupon_code.strip():
+            coupon = db.scalar(select(Coupon).where(Coupon.code == coupon_code.strip().upper(), Coupon.active.is_(True)))
+            if not coupon or (coupon.max_redemptions is not None and coupon.redeemed >= coupon.max_redemptions) or not coupon.provider_coupon_id:
+                raise HTTPException(400, "Coupon is invalid, exhausted, or not configured for Stripe.")
+            data["discounts[0][coupon]"] = coupon.provider_coupon_id
     response = httpx.post("https://api.stripe.com/v1/checkout/sessions", data=data, auth=(settings.stripe_secret_key, ""), timeout=30)
     if response.status_code >= 400:
         raise HTTPException(502, "Stripe checkout could not be created.")
+    if coupon is not None:
+        with SessionLocal() as db:
+            saved = db.get(Coupon, coupon.id)
+            if saved:
+                saved.redeemed += 1
+                db.commit()
     return RedirectResponse(response.json().get("url", "/billing"), status_code=303)
 
 
@@ -1328,6 +1340,25 @@ def admin_update_plan(request: Request, plan_id: int, limits_json: str = Form(),
         plan.yearly_price_cents = max(yearly_price_cents, 0)
         plan.active = active
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="plan_updated", entity_type="plan", entity_id=plan.id, detail={"slug": plan.slug}))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/coupons")
+def admin_create_coupon(request: Request, code: str = Form(), provider_coupon_id: str = Form(), percent_off: int = Form(0), amount_off_cents: int = Form(0), max_redemptions: int = Form(0)):
+    normalized = code.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,80}", normalized) or not provider_coupon_id.strip():
+        raise HTTPException(400, "Coupon code and Stripe coupon ID are required.")
+    if not 0 <= percent_off <= 100 or amount_off_cents < 0:
+        raise HTTPException(400, "Coupon discount is invalid.")
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        if db.scalar(select(Coupon).where(Coupon.code == normalized)):
+            raise HTTPException(409, "Coupon already exists.")
+        coupon = Coupon(code=normalized, provider_coupon_id=provider_coupon_id.strip(), percent_off=percent_off or None, amount_off_cents=amount_off_cents or None, max_redemptions=max_redemptions or None)
+        db.add(coupon)
+        db.flush()
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="coupon_created", entity_type="coupon", entity_id=coupon.id, detail={"code": normalized}))
         db.commit()
     return RedirectResponse("/admin", status_code=303)
 

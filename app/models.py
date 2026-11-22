@@ -136,6 +136,20 @@ class Plan(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class Coupon(Base):
+    __tablename__ = "coupons"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    provider_coupon_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    percent_off: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    amount_off_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration: Mapped[str] = mapped_column(String(20), default="once")
+    max_redemptions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    redeemed: Mapped[int] = mapped_column(Integer, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class Subscription(Base):
     __tablename__ = "subscriptions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

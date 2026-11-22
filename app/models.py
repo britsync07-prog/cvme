@@ -172,6 +172,18 @@ class Invoice(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class Payment(Base):
+    __tablename__ = "payments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    invoice_id: Mapped[int | None] = mapped_column(ForeignKey("invoices.id"), nullable=True, index=True)
+    provider_payment_id: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="succeeded")
+    amount_cents: Mapped[int] = mapped_column(Integer, default=0)
+    currency: Mapped[str] = mapped_column(String(3), default="gbp")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class EmailAccount(Base):
     __tablename__ = "email_accounts"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

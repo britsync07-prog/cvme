@@ -27,7 +27,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_feature, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, OutreachJob, PasswordResetToken, Plan, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, OutreachJob, PasswordResetToken, Payment, Plan, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
 from .ops import enqueue_job, kill_switch_enabled, mark_job, set_setting, setting_value
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
@@ -497,7 +497,8 @@ def export_account(request: Request):
         campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace))).all()
         jobs = db.scalars(select(OutreachJob).where(OutreachJob.workspace_id == workspace.id)).all()
         invoices = db.scalars(select(Invoice).where(Invoice.workspace_id == workspace.id)).all()
-    return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns], "jobs": [{"id": item.id, "type": item.job_type, "status": item.status, "created_at": item.created_at.isoformat()} for item in jobs], "invoices": [{"id": item.id, "status": item.status, "amount_cents": item.amount_cents, "currency": item.currency} for item in invoices]})
+        payments = db.scalars(select(Payment).where(Payment.workspace_id == workspace.id)).all()
+    return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns], "jobs": [{"id": item.id, "type": item.job_type, "status": item.status, "created_at": item.created_at.isoformat()} for item in jobs], "invoices": [{"id": item.id, "status": item.status, "amount_cents": item.amount_cents, "currency": item.currency} for item in invoices], "payments": [{"id": item.id, "status": item.status, "amount_cents": item.amount_cents, "currency": item.currency} for item in payments]})
 
 
 @app.post("/account/password")
@@ -584,6 +585,11 @@ async def billing_webhook(request: Request):
                 subscription.status = "active"
             if event_type.startswith("invoice.") and subscription:
                 db.merge(Invoice(workspace_id=subscription.workspace_id, provider_invoice_id=data.get("id"), status=data.get("status", event_type.removeprefix("invoice.")), amount_cents=int(data.get("amount_paid") or data.get("amount_due") or 0), currency=data.get("currency", "gbp")))
+                if event_type == "invoice.paid":
+                    invoice = db.scalar(select(Invoice).where(Invoice.provider_invoice_id == data.get("id")))
+                    payment_id = data.get("payment_intent") or data.get("charge")
+                    if payment_id and not db.scalar(select(Payment).where(Payment.provider_payment_id == payment_id)):
+                        db.add(Payment(workspace_id=subscription.workspace_id, invoice_id=invoice.id if invoice else None, provider_payment_id=payment_id, status="succeeded", amount_cents=int(data.get("amount_paid") or 0), currency=data.get("currency", "gbp")))
         db.commit()
     return {"ok": True}
 
@@ -648,7 +654,7 @@ def delete_account(request: Request):
             db.delete(campaign)
         for candidate in db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace))).all():
             db.delete(candidate)
-        for model in (EmailAccount, AIProviderConfig, Notification, SupportTicket, Subscription, Invoice, UsageRecord, OutreachJob, AuditEvent, AuditLog):
+        for model in (EmailAccount, AIProviderConfig, Notification, SupportTicket, Subscription, Payment, Invoice, UsageRecord, OutreachJob, AuditEvent, AuditLog):
             for item in db.scalars(select(model).where(model.workspace_id == workspace.id)).all():
                 db.delete(item)
         for item in db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id)).all():
@@ -931,7 +937,9 @@ def admin_metrics(request: Request):
         status_counts = dict(db.execute(select(Campaign.status, func.count(Campaign.id)).group_by(Campaign.status)).all())
         subscriptions = db.scalars(select(Subscription)).all()
         jobs = dict(db.execute(select(OutreachJob.status, func.count(OutreachJob.id)).group_by(OutreachJob.status)).all())
-        return JSONResponse({"users": db.scalar(select(func.count(User.id))) or 0, "workspaces": db.scalar(select(func.count(Workspace.id)).where(Workspace.deleted_at.is_(None))) or 0, "active_subscriptions": sum(1 for item in subscriptions if item.status == "active"), "trialing": sum(1 for item in subscriptions if item.status == "trialing"), "sent": status_counts.get("sent", 0), "failed": status_counts.get("failed", 0) + status_counts.get("send_uncertain", 0), "campaign_status": status_counts, "job_status": jobs, "kill_switch": kill_switch_enabled()})
+        mrr_cents = sum((item.plan.monthly_price_cents if item.plan else 0) for item in subscriptions if item.status == "active")
+        paid_cents = db.scalar(select(func.coalesce(func.sum(Payment.amount_cents), 0)).where(Payment.status == "succeeded")) or 0
+        return JSONResponse({"users": db.scalar(select(func.count(User.id))) or 0, "workspaces": db.scalar(select(func.count(Workspace.id)).where(Workspace.deleted_at.is_(None))) or 0, "active_subscriptions": sum(1 for item in subscriptions if item.status == "active"), "trialing": sum(1 for item in subscriptions if item.status == "trialing"), "mrr_cents": mrr_cents, "paid_cents": paid_cents, "sent": status_counts.get("sent", 0), "failed": status_counts.get("failed", 0) + status_counts.get("send_uncertain", 0), "campaign_status": status_counts, "job_status": jobs, "kill_switch": kill_switch_enabled()})
 
 
 @app.get("/admin/email-log")

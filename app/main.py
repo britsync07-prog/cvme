@@ -26,7 +26,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
-from .entitlements import require_candidate_slot, require_send_slot, status_for
+from .entitlements import require_candidate_slot, require_feature, require_send_slot, status_for
 from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, EmailAccount, EmailVerificationToken, Invoice, Notification, PasswordResetToken, Plan, Subscription, SupportTicket, Suppression, User, Workspace, WorkspaceMembership
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
@@ -587,7 +587,7 @@ async def billing_webhook(request: Request):
 @app.get("/billing")
 def billing_page(request: Request, success: int = 0):
     with SessionLocal() as db:
-        workspace, _ = current_workspace(request, db)
+        workspace, user = current_workspace(request, db)
         subscription = status_for(db, workspace)
         plans = db.scalars(select(Plan).where(Plan.active.is_(True)).order_by(Plan.id)).all()
     return templates.TemplateResponse(request, "billing.html", {"status": subscription, "plans": plans, "success": bool(success)})
@@ -619,7 +619,7 @@ def billing_portal(request: Request):
     if not settings.stripe_secret_key:
         raise HTTPException(503, "Stripe billing is not configured.")
     with SessionLocal() as db:
-        workspace, _ = current_workspace(request, db)
+        workspace, user = current_workspace(request, db)
         subscription = db.scalar(select(Subscription).where(Subscription.workspace_id == workspace.id).order_by(Subscription.id.desc()))
         if not subscription or not subscription.provider_customer_id:
             raise HTTPException(400, "No Stripe customer is linked to this workspace yet.")
@@ -761,6 +761,7 @@ def dashboard(request: Request, tab: str = "applications"):
         subscription_status = status_for(db, workspace)
         notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(20)).all()
         email_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
+        ai_config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -775,7 +776,9 @@ def dashboard(request: Request, tab: str = "applications"):
                 "subscription_status": subscription_status,
                 "workspace": workspace,
                 "notifications": notifications,
+                "impersonating": bool(request.session.get("impersonator_id")),
                 "email_account": email_account,
+                "ai_config": ai_config,
             },
         )
 
@@ -862,6 +865,15 @@ def admin_users(request: Request, q: str = ""):
         return JSONResponse({"users": [{"id": u.id, "email": u.email, "role": u.role, "active": u.is_active, "verified": bool(u.email_verified_at), "created_at": u.created_at.isoformat()} for u in users]})
 
 
+@app.get("/admin/metrics")
+def admin_metrics(request: Request):
+    with SessionLocal() as db:
+        _require_admin(request, db)
+        status_counts = dict(db.execute(select(Campaign.status, func.count(Campaign.id)).group_by(Campaign.status)).all())
+        subscriptions = db.scalars(select(Subscription)).all()
+        return JSONResponse({"users": db.scalar(select(func.count(User.id))) or 0, "workspaces": db.scalar(select(func.count(Workspace.id)).where(Workspace.deleted_at.is_(None))) or 0, "active_subscriptions": sum(1 for item in subscriptions if item.status == "active"), "trialing": sum(1 for item in subscriptions if item.status == "trialing"), "sent": status_counts.get("sent", 0), "failed": status_counts.get("failed", 0) + status_counts.get("send_uncertain", 0), "campaign_status": status_counts})
+
+
 @app.post("/admin/users/{user_id}/status")
 def admin_user_status(request: Request, user_id: int, active: bool = Form()):
     with SessionLocal() as db:
@@ -894,6 +906,39 @@ def admin_user_role(request: Request, user_id: int, role: str = Form()):
     return RedirectResponse("/admin", status_code=303)
 
 
+@app.post("/admin/impersonate/{user_id}")
+def admin_impersonate(request: Request, user_id: int):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        target = db.get(User, user_id)
+        membership = db.scalar(select(WorkspaceMembership).where(WorkspaceMembership.user_id == user_id).order_by(WorkspaceMembership.created_at)) if target else None
+        if not target or not membership or not target.is_active:
+            raise HTTPException(404, "Active user workspace not found.")
+        request.session["impersonator_id"] = actor.id
+        request.session.update({"authenticated": True, "user_id": target.id, "workspace_id": membership.workspace_id})
+        db.add(AuditLog(workspace_id=membership.workspace_id, user_id=actor.id, action="impersonation_started", entity_type="user", entity_id=target.id, detail={}))
+        db.commit()
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/admin/stop-impersonation")
+def stop_impersonation(request: Request):
+    actor_id = request.session.get("impersonator_id")
+    if not actor_id:
+        return RedirectResponse("/", status_code=303)
+    with SessionLocal() as db:
+        actor = db.get(User, actor_id)
+        if not actor or actor.role not in {"admin", "superadmin"}:
+            request.session.clear()
+            return RedirectResponse("/login", status_code=303)
+        workspace = db.scalar(select(Workspace).join(WorkspaceMembership).where(WorkspaceMembership.user_id == actor.id).order_by(WorkspaceMembership.created_at))
+        db.add(AuditLog(workspace_id=workspace.id if workspace else None, user_id=actor.id, action="impersonation_stopped", entity_type="user", entity_id=request.session.get("user_id"), detail={}))
+        db.commit()
+    request.session.update({"authenticated": True, "user_id": actor.id, "workspace_id": workspace.id if workspace else None})
+    request.session.pop("impersonator_id", None)
+    return RedirectResponse("/admin", status_code=303)
+
+
 @app.get("/admin/audit.csv")
 def admin_audit_csv(request: Request):
     with SessionLocal() as db:
@@ -904,6 +949,49 @@ def admin_audit_csv(request: Request):
         detail = json.dumps(row.detail or {}, ensure_ascii=False).replace('"', '""')
         lines.append(f'{row.id},{row.user_id or ""},{row.action},{row.entity_type or ""},{row.entity_id or ""},{row.created_at.isoformat()},"{detail}"')
     return PlainTextResponse("\n".join(lines), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=audit.csv"})
+
+
+@app.get("/admin/support")
+def admin_support(request: Request):
+    with SessionLocal() as db:
+        _require_admin(request, db)
+        tickets = db.scalars(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(500)).all()
+        return JSONResponse({"tickets": [{"id": t.id, "workspace_id": t.workspace_id, "user_id": t.user_id, "subject": t.subject, "body": t.body, "status": t.status, "created_at": t.created_at.isoformat()} for t in tickets]})
+
+
+@app.post("/admin/workspaces/{workspace_id}/pause")
+def admin_pause_workspace(request: Request, workspace_id: int, paused: bool = Form()):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        workspace = db.get(Workspace, workspace_id)
+        if not workspace:
+            raise HTTPException(404, "Workspace not found.")
+        workspace.paused = paused
+        db.add(AuditLog(workspace_id=workspace.id, user_id=actor.id, action="workspace_pause_changed", entity_type="workspace", entity_id=workspace.id, detail={"paused": paused}, ip_address=request.client.host if request.client else None))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/plans/{plan_id}")
+def admin_update_plan(request: Request, plan_id: int, limits_json: str = Form(), monthly_price_cents: int = Form(0), yearly_price_cents: int = Form(0), active: bool = Form(True)):
+    with SessionLocal() as db:
+        actor = _require_admin(request, db)
+        plan = db.get(Plan, plan_id)
+        if not plan:
+            raise HTTPException(404, "Plan not found.")
+        try:
+            limits = json.loads(limits_json)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "limits_json must be valid JSON.") from exc
+        if not isinstance(limits, dict) or any(not isinstance(value, (bool, int, float)) for value in limits.values()):
+            raise HTTPException(400, "Plan limits must be a JSON object of numeric/boolean values.")
+        plan.limits = limits
+        plan.monthly_price_cents = max(monthly_price_cents, 0)
+        plan.yearly_price_cents = max(yearly_price_cents, 0)
+        plan.active = active
+        db.add(AuditLog(workspace_id=None, user_id=actor.id, action="plan_updated", entity_type="plan", entity_id=plan.id, detail={"slug": plan.slug}))
+        db.commit()
+    return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/candidates")
@@ -981,6 +1069,7 @@ def create_campaign(
                 raise HTTPException(404, "Workspace not found")
         else:
             workspace, user = ensure_default_workspace(db)
+        require_feature(db, workspace, "campaigns")
         candidate = require_owned(db, Candidate, candidate_id, workspace)
         campaign = Campaign(
             workspace_id=workspace.id,
@@ -1117,6 +1206,7 @@ def prepare_campaign(campaign_id: int, request: Request = None, workspace_id: in
             workspace = db.get(Workspace, workspace_id)
         else:
             workspace, _ = ensure_default_workspace(db)
+        require_feature(db, workspace, "ai_tailoring")
         campaign = require_owned(db, Campaign, campaign_id, workspace)
         try:
             campaign.status = "researching"
@@ -1303,7 +1393,7 @@ def save_settings(
     outreach_schedule_time: str = Form("09:00"),
 ):
     with SessionLocal() as db:
-        workspace, _ = current_workspace(request, db)
+        workspace, user = current_workspace(request, db)
         try:
             ZoneInfo(outreach_timezone.strip() or workspace.timezone)
         except ZoneInfoNotFoundError as exc:
@@ -1328,18 +1418,18 @@ def save_settings(
             db.commit()
         db.commit()
     update_settings(
-        base_url=base_url.strip() or settings.base_url,
-        api_key=api_key.strip() or settings.api_key,
-        llm_model=llm_model.strip() or settings.llm_model,
-        smtp_host=smtp_host.strip() or settings.smtp_host,
-        smtp_port=smtp_port,
-        smtp_username=smtp_username.strip() or settings.smtp_username,
-        smtp_password=smtp_password.strip() or settings.smtp_password,
-        smtp_from=smtp_from.strip() or settings.smtp_from,
-        smtp_use_tls=smtp_use_tls,
-        resend_api_key=resend_api_key.strip() or settings.resend_api_key,
-        resend_from=resend_from.strip() or settings.resend_from,
-        companies_house_api_key=companies_house_api_key.strip() or settings.companies_house_api_key,
+        base_url=(base_url.strip() or settings.base_url) if user.role in {"admin", "superadmin"} else settings.base_url,
+        api_key=(api_key.strip() or settings.api_key) if user.role in {"admin", "superadmin"} else settings.api_key,
+        llm_model=(llm_model.strip() or settings.llm_model) if user.role in {"admin", "superadmin"} else settings.llm_model,
+        smtp_host=(smtp_host.strip() or settings.smtp_host) if user.role in {"admin", "superadmin"} else settings.smtp_host,
+        smtp_port=smtp_port if user.role in {"admin", "superadmin"} else settings.smtp_port,
+        smtp_username=(smtp_username.strip() or settings.smtp_username) if user.role in {"admin", "superadmin"} else settings.smtp_username,
+        smtp_password=(smtp_password.strip() or settings.smtp_password) if user.role in {"admin", "superadmin"} else settings.smtp_password,
+        smtp_from=(smtp_from.strip() or settings.smtp_from) if user.role in {"admin", "superadmin"} else settings.smtp_from,
+        smtp_use_tls=smtp_use_tls if user.role in {"admin", "superadmin"} else settings.smtp_use_tls,
+        resend_api_key=(resend_api_key.strip() or settings.resend_api_key) if user.role in {"admin", "superadmin"} else settings.resend_api_key,
+        resend_from=(resend_from.strip() or settings.resend_from) if user.role in {"admin", "superadmin"} else settings.resend_from,
+        companies_house_api_key=(companies_house_api_key.strip() or settings.companies_house_api_key) if user.role in {"admin", "superadmin"} else settings.companies_house_api_key,
         scrapollo_binary=scrapollo_binary.strip() or "scrapollo",
         scrapollo_cookie_file=scrapollo_cookie_file.strip() or settings.scrapollo_cookie_file,
         scrapollo_input_file=scrapollo_input_file.strip() or settings.scrapollo_input_file,

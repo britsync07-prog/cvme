@@ -1,6 +1,7 @@
 """Single entitlement boundary for plan, trial, and send limits."""
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
@@ -51,7 +52,8 @@ def require_candidate_slot(db, workspace: Workspace, additional: int = 1) -> Non
 def require_send_slot(db, workspace: Workspace) -> None:
     status = require_feature(db, workspace, "daily_emails")
     limit = int(status["limits"].get("daily_emails", settings.outreach_daily_limit))
-    start = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    local = datetime.now(ZoneInfo(workspace.timezone))
+    start = local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     count = db.scalar(select(func.count(Campaign.id)).where(Campaign.workspace_id == workspace.id, Campaign.status == "sent", Campaign.sent_at >= start)) or 0
     if count >= limit:
         raise HTTPException(429, f"Daily email limit reached ({limit}).")

@@ -42,6 +42,7 @@
   </nav>
 
   <main class="main-content">
+    {% if impersonating %}<div class="panel login-error"><strong>Impersonation active.</strong> You are viewing another workspace. <form method="post" action="/admin/stop-impersonation" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small secondary" type="submit">Return to admin</button></form></div>{% endif %}
     {% if notifications %}<section class="panel"><div class="panel-header"><h2>Notifications</h2></div>{% for notice in notifications %}<div class="notice-row"><span>{{ notice.message }}</span><form method="post" action="/notifications/{{ notice.id }}/read"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small ghost" type="submit">Mark read</button></form></div>{% endfor %}</section>{% endif %}
     {% if subscription_status and subscription_status.trial_active %}<div class="panel trial-banner"><strong>{{ subscription_status.trial_days_left }} trial days remaining.</strong> Upgrade before your trial ends to keep sending.</div>{% elif subscription_status and not subscription_status.active %}<div class="panel login-error"><strong>Sending is paused.</strong> Your trial or subscription is inactive.</div>{% endif %}
     {% if active_tab == 'applications' %}
@@ -365,18 +366,18 @@
           <div class="form-row">
             <label class="field">
               <span>API Base URL <strong class="req">*</strong></span>
-              <input name="base_url" id="base_url" value="{{ settings.base_url }}" placeholder="http://127.0.0.1:31415" required>
+              <input name="base_url" id="base_url" value="{{ ai_config.base_url if ai_config else settings.base_url }}" placeholder="http://127.0.0.1:31415" required>
             </label>
             <label class="field">
               <span>API Key</span>
-              <input name="api_key" id="api_key" type="password" value="{{ settings.api_key }}" placeholder="e.g. freellmapi-key or local-token">
+              <input name="api_key" id="api_key" type="password" value="" placeholder="{{ 'Configured — enter a new key to rotate' if settings.api_key else 'e.g. provider-key or local-token' }}">
             </label>
           </div>
 
           <div class="form-row">
             <label class="field">
               <span>Model Identifier</span>
-              <input name="llm_model" id="llm_model" value="{{ settings.llm_model }}" placeholder="local-model or auto">
+              <input name="llm_model" id="llm_model" value="{{ ai_config.model_name if ai_config else settings.llm_model }}" placeholder="local-model or auto">
             </label>
             <div class="field align-end">
               <button type="button" class="button secondary" onclick="testLLM()">⚡ Test LLM Endpoint</button>
@@ -392,7 +393,7 @@
           <div class="form-row">
             <label class="field">
               <span>Resend API Key</span>
-              <input name="resend_api_key" type="password" value="{{ settings.resend_api_key }}" placeholder="re_...">
+              <input name="resend_api_key" type="password" value="" placeholder="{{ 'Configured — enter a new key to rotate' if settings.resend_api_key else 're_...' }}">
             </label>
             <label class="field">
               <span>Verified From Address</span>
@@ -418,7 +419,7 @@
             </label>
             <label class="field">
               <span>SMTP Password</span>
-              <input name="smtp_password" id="smtp_password" type="password" value="{{ settings.smtp_password }}">
+              <input name="smtp_password" id="smtp_password" type="password" value="" placeholder="{{ 'Configured — enter a new password to rotate' if settings.smtp_password else '' }}">
             </label>
           </div>
 
@@ -449,7 +450,7 @@
         <div class="settings-section">
           <h3>UK company discovery</h3>
           <p class="subtitle">Uses the free Companies House API plus DuckDuckGo and public company websites. No paid search API is required.</p>
-          <label class="field"><span>Companies House REST API key</span><input name="companies_house_api_key" type="password" value="{{ settings.companies_house_api_key }}"></label>
+          <label class="field"><span>Companies House REST API key</span><input name="companies_house_api_key" type="password" value="" placeholder="{{ 'Configured — enter a new key to rotate' if settings.companies_house_api_key else '' }}"></label>
         </div>
 
         <div class="settings-section">

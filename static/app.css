@@ -1012,8 +1012,12 @@ main.main-content .panel {
 /* Public pages: same TailorMail tokens, with enough structure for real policy copy. */
 .public-links { display: flex; align-items: center; gap: 18px; }
 .public-shell { font-size: 16px; }
-.public-shell .panel { box-shadow: none; }
+.public-shell .panel { box-shadow: none; border: 0; background: var(--surface-alt); }
 .public-shell .public-nav { border-bottom: 0; }
+.public-shell a { color: inherit; text-underline-offset: 3px; }
+.public-shell section, .public-shell footer { animation: public-rise .45s ease both; }
+@keyframes public-rise { from { opacity: .01; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .public-shell section, .public-shell footer { animation: none; } }
 .public-links a:not(.button-link), .public-footer a { color: var(--text-muted); text-decoration: none; }
 .public-links a:not(.button-link):hover, .public-footer a:hover { color: var(--primary); }
 .legal-page { max-width: 940px; margin: 42px auto 80px; }

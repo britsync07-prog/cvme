@@ -54,6 +54,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    entrypoint: ["/app/scripts/start_worker.sh"]
     command: ["python", "-m", "app.worker"]
     volumes:
       - artifacts:/app/artifacts
@@ -67,6 +68,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    entrypoint: ["/app/scripts/start_worker.sh"]
     command: ["python", "-m", "app.scheduler"]
     restart: unless-stopped
 

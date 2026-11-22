@@ -18,6 +18,7 @@
       <label>Email<input name="email" type="email" autocomplete="email" required autofocus></label>
       <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
       <label class="checkbox-row"><input name="terms" type="checkbox" required> I accept the privacy terms and acceptable-use policy.</label>
+      {% if settings and settings.turnstile_site_key %}<div class="cf-turnstile" data-sitekey="{{ settings.turnstile_site_key }}"></div><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>{% endif %}
       <button type="submit">Create workspace</button>
     </form>
     <p class="login-copy">Already registered? <a href="/login">Sign in</a></p>

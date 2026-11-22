@@ -73,6 +73,20 @@ def csrf_token(request: Request) -> str:
 templates.env.globals["csrf_token"] = csrf_token
 
 
+def rate_limited(request: Request, bucket: str, limit: int, window: int = 900) -> bool:
+    """Best-effort distributed limiter; availability of Redis must not take down auth."""
+    try:
+        address = request.client.host if request.client else "unknown"
+        client = redis.Redis.from_url(settings.redis_url)
+        key = f"tailormail:rate:{bucket}:{address}"
+        count = client.incr(key)
+        if count == 1:
+            client.expire(key, window)
+        return count > limit
+    except Exception:
+        return False
+
+
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if (
@@ -96,10 +110,11 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
+            "script-src 'self' https://challenges.cloudflare.com; "
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com data:; "
             "img-src 'self' data:; "
-            "frame-src 'self'; "
+            "frame-src 'self' https://challenges.cloudflare.com; "
             "base-uri 'self'; "
             "form-action 'self'"
         )
@@ -155,7 +170,7 @@ def login_page(request: Request, next: str = "/", mfa: int = 0):
 
 @app.get("/signup")
 def signup_page(request: Request):
-    return templates.TemplateResponse(request, "signup.html", {"error": ""})
+    return templates.TemplateResponse(request, "signup.html", {"error": "", "settings": settings})
 
 
 @app.get("/auth/google")
@@ -284,21 +299,31 @@ def signup(
     email: str = Form(),
     password: str = Form(),
     terms: bool = Form(False),
+    turnstile_token: str = Form(""),
 ):
+    if rate_limited(request, "signup", 10):
+        raise HTTPException(429, "Too many signup attempts. Try again later.")
     if not settings.signup_enabled:
         raise HTTPException(403, "New signups are currently closed.")
+    if settings.turnstile_secret_key:
+        try:
+            challenge = httpx.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", data={"secret": settings.turnstile_secret_key, "response": turnstile_token, "remoteip": request.client.host if request.client else ""}, timeout=10)
+            if not challenge.json().get("success"):
+                raise ValueError
+        except (httpx.HTTPError, ValueError):
+            return templates.TemplateResponse(request, "signup.html", {"error": "Complete the bot verification challenge.", "settings": settings}, status_code=400)
     if not terms:
-        return templates.TemplateResponse(request, "signup.html", {"error": "You must accept the acceptable-use and privacy terms."}, status_code=400)
+        return templates.TemplateResponse(request, "signup.html", {"error": "You must accept the acceptable-use and privacy terms.", "settings": settings}, status_code=400)
     email = email.strip().lower()
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        return templates.TemplateResponse(request, "signup.html", {"error": "Enter a valid email address."}, status_code=400)
+        return templates.TemplateResponse(request, "signup.html", {"error": "Enter a valid email address.", "settings": settings}, status_code=400)
     try:
         password_hash = hash_password(password)
     except ValueError as exc:
-        return templates.TemplateResponse(request, "signup.html", {"error": str(exc)}, status_code=400)
+        return templates.TemplateResponse(request, "signup.html", {"error": str(exc), "settings": settings}, status_code=400)
     with SessionLocal() as db:
         if db.scalar(select(User).where(User.email == email)):
-            return templates.TemplateResponse(request, "signup.html", {"error": "An account with that email already exists."}, status_code=409)
+            return templates.TemplateResponse(request, "signup.html", {"error": "An account with that email already exists.", "settings": settings}, status_code=409)
         user = User(email=email, password_hash=password_hash, role="user", terms_accepted_at=utc_now())
         db.add(user)
         db.flush()
@@ -357,6 +382,8 @@ def forgot_password_page(request: Request):
 
 @app.post("/forgot-password")
 def forgot_password(request: Request, email: str = Form()):
+    if rate_limited(request, "password-reset", 10):
+        return templates.TemplateResponse(request, "forgot_password.html", {"message": "If that email exists, a reset link has been sent."})
     normalized = email.strip().lower()
     with SessionLocal() as db:
         user = db.scalar(select(User).where(User.email == normalized, User.is_active.is_(True)))
@@ -396,6 +423,8 @@ def reset_password(request: Request, token: str = Form(), password: str = Form()
 
 @app.post("/login")
 def login(request: Request, username: str = Form(""), password: str = Form(""), next: str = Form("/"), otp: str = Form("")):
+    if rate_limited(request, "login", 30):
+        return templates.TemplateResponse(request, "login.html", {"next": _safe_next(next), "error": "Too many attempts. Try again later.", "mfa": False}, status_code=429)
     email = username.strip().lower()
     with SessionLocal() as db:
         pending_id = request.session.get("pending_mfa_user_id")
@@ -454,6 +483,38 @@ def export_account(request: Request):
         candidates = db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace))).all()
         campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace))).all()
     return JSONResponse({"user": {"id": user.id, "email": user.email}, "workspace": {"id": workspace.id, "name": workspace.name}, "candidates": [{"id": item.id, "name": item.name, "email": item.email, "cv_yaml": item.cv_yaml} for item in candidates], "campaigns": [{"id": item.id, "company_name": item.company_name, "recipient_email": item.recipient_email, "status": item.status, "email_subject": item.email_subject, "email_body": item.email_body} for item in campaigns]})
+
+
+@app.post("/account/password")
+def change_password(request: Request, current_password: str = Form(), new_password: str = Form()):
+    with SessionLocal() as db:
+        _, user = current_workspace(request, db)
+        if not user.password_hash or not verify_password(user.password_hash, current_password):
+            raise HTTPException(400, "Current password is incorrect.")
+        user.password_hash = hash_password(new_password)
+        db.commit()
+    return RedirectResponse("/?tab=settings", status_code=303)
+
+
+@app.post("/account/email")
+def change_email(request: Request, email: str = Form()):
+    normalized = email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+        raise HTTPException(400, "Enter a valid email address.")
+    with SessionLocal() as db:
+        _, user = current_workspace(request, db)
+        if db.scalar(select(User).where(User.email == normalized, User.id != user.id)):
+            raise HTTPException(409, "That email is already in use.")
+        user.email = normalized
+        user.email_verified_at = None
+        raw = new_token()
+        db.add(EmailVerificationToken(user_id=user.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=24)))
+        db.commit()
+        try:
+            send_system_email(normalized, "Verify your new TailorMail email", f"Verify your new address: {settings.base_url}/verify-email?token={raw}")
+        except Exception:
+            pass
+    return RedirectResponse("/verify-email", status_code=303)
 
 
 @app.post("/billing/webhook", include_in_schema=False)
@@ -554,6 +615,11 @@ def delete_account(request: Request):
         user.is_active = False
         db.execute(update(Candidate).where(workspace_filter(Candidate, workspace)).values(deleted_at=utc_now()))
         db.execute(update(Campaign).where(workspace_filter(Campaign, workspace)).values(deleted_at=utc_now()))
+        for model in (EmailAccount, AIProviderConfig, Notification, SupportTicket, Subscription):
+            for item in db.scalars(select(model).where(model.workspace_id == workspace.id)).all():
+                db.delete(item)
+        for item in db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id)).all():
+            db.delete(item)
         db.commit()
     request.session.clear()
     return RedirectResponse("/login", status_code=303)

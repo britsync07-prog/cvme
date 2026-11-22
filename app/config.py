@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = ""
+    turnstile_secret_key: str = ""
+    turnstile_site_key: str = ""
 
 
 settings = Settings()

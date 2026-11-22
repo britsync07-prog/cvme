@@ -12,7 +12,7 @@ COPY --chown=appuser:appuser scripts ./scripts
 COPY --chown=appuser:appuser alembic.ini ./alembic.ini
 COPY --chown=appuser:appuser alembic ./alembic
 RUN mkdir -p /app/data /app/artifacts && chown -R appuser:appuser /app
-RUN chmod 755 /app/scripts/start_app.sh
+RUN chmod 755 /app/scripts/start_app.sh /app/scripts/start_worker.sh
 USER appuser
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD python -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/healthz', timeout=3)" || exit 1

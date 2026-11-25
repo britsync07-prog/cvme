@@ -6,13 +6,14 @@ import sys
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 import zipfile
 
 import pytest
 import yaml
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app import daily_outreach, services
 from app.db import Base, SessionLocal, engine
@@ -205,97 +206,17 @@ def test_research_adds_one_independent_public_search_source(monkeypatch):
     ]
 
 
-def test_discover_company_lead_uses_public_generic_email(monkeypatch):
-    class Response:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"items": [{"title": "Acme Limited", "company_number": "123", "company_status": "active"}]}
-
-    monkeypatch.setattr(services.settings, "companies_house_api_key", "test-key")
-    monkeypatch.setattr(services.httpx, "get", lambda *a, **k: Response())
-    monkeypatch.setattr(services, "_search_web", lambda query: ["https://acme.example"])
-    monkeypatch.setattr(services, "_website_text", lambda url: (url, "Contact careers@acme.example for recruitment."))
-
-    lead = services.discover_company_lead("acme")
-    assert lead["company_name"] == "Acme Limited"
-    assert lead["recipient_email"] == "careers@acme.example"
-
-
-def test_discover_company_leads_skips_existing_companies(monkeypatch):
-    class Response:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"items": [
-                {"title": "Acme Limited", "company_number": "123", "company_status": "active"},
-                {"title": "Beta Limited", "company_number": "456", "company_status": "active"},
-            ]}
-
-    monkeypatch.setattr(services.settings, "companies_house_api_key", "test-key")
-    monkeypatch.setattr(services.httpx, "get", lambda *a, **k: Response())
-    monkeypatch.setattr(services, "_search_web", lambda query: ["https://company.example"])
-    monkeypatch.setattr(services, "_website_text", lambda url: (url, "Contact careers@company.example"))
-
-    leads = services.discover_company_leads("limited", 2, {"acme limited"})
-    assert [lead["company_name"] for lead in leads] == ["Beta Limited"]
-
-
-def test_discover_company_leads_reads_additional_companies_house_pages(monkeypatch):
-    class Response:
-        def __init__(self, items):
-            self.items = items
-
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"items": self.items}
-
-    pages = {
-        0: [{"title": "Acme Limited", "company_number": "123", "company_status": "active"}],
-        100: [{"title": "Beta Limited", "company_number": "456", "company_status": "active"}],
-    }
-    starts = []
-
-    def get(*args, **kwargs):
-        start = kwargs["params"]["start_index"]
-        starts.append(start)
-        return Response(pages.get(start, []))
-
-    monkeypatch.setattr(services.settings, "companies_house_api_key", "test-key")
-    monkeypatch.setattr(services.httpx, "get", get)
-    monkeypatch.setattr(services, "_search_web", lambda query: ["https://company.example"])
-    monkeypatch.setattr(services, "_website_text", lambda url: (url, "Contact careers@company.example"))
-
-    leads = services.discover_company_leads("limited", 2)
-    assert [lead["company_number"] for lead in leads] == ["123", "456"]
-    assert starts == [0, 100]
-
-
-def test_batch_route_prepares_each_discovered_lead(monkeypatch):
-    with SessionLocal() as db:
-        candidate = Candidate(name="Test Person", email="person@tailormail.invalid", cv_yaml="cv:\n  name: Test Person\n  sections: {}\n")
-        db.add(candidate)
-        db.commit()
-        candidate_id = candidate.id
-
-    monkeypatch.setattr(main, "discover_company_leads", lambda *args: [{
-        "company_name": "Beta Limited", "company_number": "456", "company_url": "https://beta.example",
-        "recipient_email": "careers@beta.example", "source_urls": ["https://beta.example/careers"],
-    }])
-    created = []
-    monkeypatch.setattr(main, "create_campaign", lambda **kwargs: (created.append(kwargs) or main.RedirectResponse("/campaigns/9")))
-
+def test_company_lead_routes_are_retired_in_favor_of_jobs():
     with TestClient(app, base_url="http://localhost") as client:
-        response = client.post("/leads/batch", data={"candidate_id": candidate_id, "query": "beta", "limit": 1})
-        dashboard = client.get("/")
+        redirect = client.get("/leads", follow_redirects=False)
+        retired = client.post("/leads/batch", data={"candidate_id": 1, "query": "beta", "limit": 1})
+        dashboard = client.get("/?tab=jobs")
 
-    assert response.json() == {"discovered": 1, "completed": 1, "sent": 0}
-    assert "Emails Sent Today" in dashboard.text
-    assert created[0]["auto_prepare"] is True
+    assert redirect.status_code == 303
+    assert redirect.headers["location"] == "/?tab=jobs"
+    assert retired.status_code == 410
+    assert "Lead discovery" not in dashboard.text
+    assert "Search jobs across enabled sources" in dashboard.text
 
 
 def test_daily_send_budget_counts_sent_campaigns(monkeypatch):
@@ -338,7 +259,6 @@ def _configure_daily_worker(monkeypatch, candidate_id: int) -> None:
     monkeypatch.setattr(daily_outreach.settings, "outreach_target_role", "Backend Engineer")
     monkeypatch.setattr(daily_outreach.settings, "outreach_daily_limit", 100)
     monkeypatch.setattr(daily_outreach.settings, "outreach_auto_send", True)
-    monkeypatch.setattr(daily_outreach.settings, "companies_house_api_key", "test-key")
     monkeypatch.setattr(daily_outreach.settings, "api_key", "test-key")
     monkeypatch.setattr(daily_outreach.settings, "base_url", "http://llm.example/v1")
     monkeypatch.setattr(daily_outreach.settings, "llm_model", "test-model")
@@ -351,10 +271,10 @@ def test_daily_worker_returns_cleanly_when_auto_send_has_no_verified_leads(monke
     _configure_daily_worker(monkeypatch, _outreach_ready_candidate_id())
     monkeypatch.setattr(
         daily_outreach,
-        "discover_lead_batch",
-        lambda **kwargs: JSONResponse({"discovered": 0, "completed": 0, "sent": 0}),
+        "discover_job_batch",
+        lambda **kwargs: {"discovered": 0, "completed": 0, "sent": 0},
     )
-    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: 99)
+    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda *args: 99)
 
     daily_outreach.main()
 
@@ -383,17 +303,16 @@ def test_daily_worker_uses_platform_defaults_for_an_empty_workspace(monkeypatch)
     calls = []
     monkeypatch.setattr(
         daily_outreach,
-        "discover_lead_batch",
-        lambda **kwargs: (calls.append(kwargs) or JSONResponse({"discovered": 1, "completed": 1, "sent": 1})),
+        "discover_job_batch",
+        lambda **kwargs: (calls.append(kwargs) or {"discovered": 1, "completed": 1, "sent": 1}),
     )
-    remaining = iter([1, 0])
-    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda *args: next(remaining))
+    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda *args: 1)
 
     daily_outreach.main(workspace_id=workspace_id)
 
     assert calls == [{
         "candidate_id": candidate_id,
-        "query": "software",
+        "keywords": "software",
         "target_role": "Backend Engineer",
         "limit": 1,
         "send_when_ready": True,
@@ -415,33 +334,72 @@ def test_daily_worker_accepts_completed_daily_send_target(monkeypatch):
     _configure_daily_worker(monkeypatch, _outreach_ready_candidate_id())
     monkeypatch.setattr(
         daily_outreach,
-        "discover_lead_batch",
-        lambda **kwargs: JSONResponse({"discovered": 100, "completed": 100, "sent": 100}),
+        "discover_job_batch",
+        lambda **kwargs: {"discovered": 100, "completed": 100, "sent": 100},
     )
-    remaining = iter([100, 0])
-    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: next(remaining))
+    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda *args: 100)
 
     daily_outreach.main()
 
 
-def test_daily_worker_retries_until_daily_send_target_is_met(monkeypatch):
+def test_daily_worker_runs_one_job_search_batch_per_schedule(monkeypatch):
     _configure_daily_worker(monkeypatch, _outreach_ready_candidate_id())
-    limits = []
-    results = iter([
-        JSONResponse({"discovered": 40, "completed": 40, "sent": 40}),
-        JSONResponse({"discovered": 60, "completed": 60, "sent": 60}),
-    ])
-    remaining = iter([100, 60, 0])
+    calls = []
     monkeypatch.setattr(
         daily_outreach,
-        "discover_lead_batch",
-        lambda **kwargs: (limits.append(kwargs["limit"]) or next(results)),
+        "discover_job_batch",
+        lambda **kwargs: (calls.append(kwargs) or {"discovered": 100, "completed": 100, "sent": 100}),
     )
-    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: next(remaining))
+    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda *args: 100)
 
     daily_outreach.main()
 
-    assert limits == [1, 1]
+    assert len(calls) == 1
+
+
+def test_scheduled_job_batch_prepares_and_sends_a_verified_employer_contact(monkeypatch):
+    candidate_id = _outreach_ready_candidate_id()
+    with SessionLocal() as db:
+        workspace, _ = ensure_default_workspace(db)
+        candidate = db.get(Candidate, candidate_id)
+        candidate.workspace_id = workspace.id
+        db.commit()
+        workspace_id = workspace.id
+
+    job = SimpleNamespace(
+        id=99,
+        company_name="Acme Ltd",
+        company_website="https://acme.example",
+        apply_url="https://acme.example/jobs/backend",
+        title="Backend Engineer",
+        description="Build reliable APIs.",
+    )
+    searches = []
+    async def aggregate(query):
+        searches.append(query)
+        return [SimpleNamespace()], []
+
+    created, sent = [], []
+    monkeypatch.setattr(daily_outreach, "aggregate_search", aggregate)
+    monkeypatch.setattr(daily_outreach, "_persist_jobs", lambda *args: [job])
+    monkeypatch.setattr(daily_outreach, "find_public_company_contacts", lambda *args: [{"email": "careers@acme.example", "verified_mx": True}])
+    monkeypatch.setattr(daily_outreach, "create_campaign", lambda **kwargs: (created.append(kwargs) or RedirectResponse("/campaigns/77", status_code=303)))
+    monkeypatch.setattr(daily_outreach, "send_campaign", lambda campaign_id, **kwargs: sent.append((campaign_id, kwargs)))
+
+    result = daily_outreach.discover_job_batch(
+        workspace_id=workspace_id,
+        candidate_id=candidate_id,
+        keywords="backend engineer",
+        target_role="Backend Engineer",
+        limit=3,
+        send_when_ready=True,
+    )
+
+    assert searches[0].keywords == "backend engineer"
+    assert created[0]["job_id"] == 99
+    assert created[0]["recipient_email"] == "careers@acme.example"
+    assert sent == [(77, {"approved": True, "workspace_id": workspace_id})]
+    assert result == {"discovered": 1, "completed": 1, "sent": 1}
 
 
 def test_search_web_uses_duckduckgo_lite_when_html_has_no_results(monkeypatch):
@@ -582,7 +540,7 @@ def test_discovery_email_is_grounded_in_candidate_facts(monkeypatch):
         {"sources": [{"url": "https://acme.example", "content": "Acme home page"}]},
         "Acme Corp",
         target_role="Backend Engineer",
-        job_description="Companies House number: 123. Public contact sources: https://acme.example",
+        job_description="Job listing: https://acme.example/jobs/backend",
     )
     assert result["email_subject"] == "Interest in Acme Corp's technology growth"
     assert "Acme Corp" in result["email_body"]

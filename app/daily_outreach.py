@@ -1,21 +1,26 @@
-"""Run one configured daily outreach batch; invoke this from the server scheduler."""
+"""Run one scheduled job-led outreach batch."""
 
+import asyncio
 import json
 import random
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from fastapi import HTTPException
 from sqlalchemy import select
 
 from .config import settings
 from .db import SessionLocal
-from .main import discover_lead_batch, remaining_daily_send_budget
-from .models import Candidate, EmailAccount, Workspace
+from .jobs import JobQuery, aggregate_search, find_public_company_contacts
+from .main import _persist_jobs, create_campaign, remaining_daily_send_budget, send_campaign
+from .models import Campaign, Candidate, EmailAccount, User, Workspace
+from .ops import kill_switch_enabled, mark_job
 from .services import cv_outreach_readiness_error
 from .tenancy import ensure_default_workspace
-from .ops import kill_switch_enabled, mark_job
 
 
 def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
+    """Validate the scheduled job-search outreach configuration without sending."""
     errors: list[str] = []
     configured_candidate = settings.outreach_candidate_id
     configured_query = settings.outreach_query
@@ -43,12 +48,10 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
             errors.append("Workspace not found.")
     if not configured_candidate:
         errors.append("OUTREACH_CANDIDATE_ID is required.")
-    if not configured_query:
-        errors.append("OUTREACH_QUERY is required.")
+    if not (configured_query or configured_role):
+        errors.append("OUTREACH_QUERY or OUTREACH_TARGET_ROLE is required for job search.")
     if not 1 <= configured_limit <= 100:
         errors.append("Daily outreach limit must be between 1 and 100.")
-    if not settings.companies_house_api_key:
-        errors.append("COMPANIES_HOUSE_API_KEY is required.")
     if not settings.api_key or not settings.base_url or not settings.llm_model:
         errors.append("BASE_URL, API_KEY, and LLM_MODEL are required.")
     if workspace_auto_send:
@@ -85,6 +88,75 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
     return errors
 
 
+def discover_job_batch(
+    *,
+    workspace_id: int | None,
+    candidate_id: int,
+    keywords: str,
+    target_role: str,
+    limit: int,
+    send_when_ready: bool,
+) -> dict[str, int]:
+    """Find real job listings, prepare one campaign per new listing, and optionally send it."""
+    limit = min(max(limit, 1), 100)
+    job_query = JobQuery(keywords=keywords, page_size=limit)
+    results, statuses = asyncio.run(aggregate_search(job_query))
+
+    with SessionLocal() as db:
+        workspace = db.get(Workspace, workspace_id) if workspace_id else ensure_default_workspace(db)[0]
+        owner = db.get(User, workspace.owner_user_id) if workspace.owner_user_id else None
+        if not owner:
+            raise RuntimeError("Workspace owner was not found.")
+        jobs = _persist_jobs(db, workspace, owner, job_query, results, statuses)
+        db.commit()
+
+    totals = {"discovered": len(jobs), "completed": 0, "sent": 0}
+    for job in jobs:
+        if totals["sent"] >= limit:
+            break
+        with SessionLocal() as db:
+            existing = db.scalar(
+                select(Campaign.id).where(
+                    Campaign.workspace_id == (workspace_id or ensure_default_workspace(db)[0].id),
+                    Campaign.job_id == job.id,
+                    Campaign.deleted_at.is_(None),
+                )
+            )
+        if existing:
+            continue
+
+        try:
+            contacts = find_public_company_contacts(job.company_name, job.company_website, job.apply_url)
+        except (ValueError, OSError):
+            continue
+        contact = next((item for item in contacts if item.get("verified_mx")), None)
+        if not contact:
+            continue
+
+        try:
+            response = create_campaign(
+                workspace_id=workspace_id,
+                job_id=job.id,
+                candidate_id=candidate_id,
+                company_name=job.company_name,
+                company_url=job.company_website or job.apply_url,
+                target_role=target_role or job.title,
+                job_description=job.description or f"Job listing: {job.apply_url}",
+                recipient_email=contact["email"],
+                auto_prepare=True,
+            )
+            campaign_id = int(response.headers["location"].rsplit("/", 1)[-1])
+            totals["completed"] += 1
+            if send_when_ready:
+                send_campaign(campaign_id, approved=True, workspace_id=workspace_id)
+                totals["sent"] += 1
+                if settings.environment == "production":
+                    time.sleep(random.uniform(max(settings.outreach_min_delay_seconds, 0), max(settings.outreach_max_delay_seconds, settings.outreach_min_delay_seconds)))
+        except HTTPException:
+            continue
+    return totals
+
+
 def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
     if kill_switch_enabled():
         raise SystemExit("Outreach kill switch is enabled.")
@@ -93,62 +165,39 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
     errors = production_preflight_errors(workspace_id)
     if errors:
         raise SystemExit("\n".join(errors))
-    totals = {"discovered": 0, "completed": 0, "sent": 0}
-    while True:
-        with SessionLocal() as db:
-            try:
-                remaining = remaining_daily_send_budget(db, workspace_id)
-            except TypeError:  # compatibility with older test/integration hooks
-                remaining = remaining_daily_send_budget(db)
-        if remaining == 0:
-            print(json.dumps(totals))
-            if job_id:
-                mark_job(job_id, "succeeded", progress=100)
-            return
-        with SessionLocal() as db:
-            workspace = db.get(Workspace, workspace_id) if workspace_id else ensure_default_workspace(db)[0]
-            # A workspace may deliberately override the platform defaults.  For
-            # older/default workspaces, however, empty fields must inherit the
-            # configured production values just as the preflight check does.
-            # Without this fallback the scheduler passes preflight but discovers
-            # no usable leads because it calls the batch with empty parameters.
-            candidate_id = (workspace.outreach_candidate_id or settings.outreach_candidate_id) if workspace_id else settings.outreach_candidate_id
-            query = (workspace.outreach_query or settings.outreach_query) if workspace_id else settings.outreach_query
-            target_role = (workspace.outreach_target_role or settings.outreach_target_role) if workspace_id else settings.outreach_target_role
-            auto_send = bool(getattr(workspace, "outreach_auto_send", settings.outreach_auto_send)) if workspace_id else settings.outreach_auto_send
-        response = discover_lead_batch(
-            candidate_id=candidate_id,
-            query=query,
-            target_role=target_role,
-            limit=1 if auto_send else remaining,
-            send_when_ready=auto_send,
+
+    with SessionLocal() as db:
+        remaining = remaining_daily_send_budget(db, workspace_id)
+        workspace = db.get(Workspace, workspace_id) if workspace_id else ensure_default_workspace(db)[0]
+        candidate_id = workspace.outreach_candidate_id or settings.outreach_candidate_id
+        keywords = workspace.outreach_query or settings.outreach_query or workspace.outreach_target_role or settings.outreach_target_role
+        target_role = workspace.outreach_target_role or settings.outreach_target_role
+        auto_send = bool(getattr(workspace, "outreach_auto_send", settings.outreach_auto_send)) if workspace_id else settings.outreach_auto_send
+
+    if remaining == 0:
+        result = {"discovered": 0, "completed": 0, "sent": 0}
+        status, error = "succeeded", None
+    else:
+        result = discover_job_batch(
             workspace_id=workspace_id,
+            candidate_id=candidate_id,
+            keywords=keywords,
+            target_role=target_role,
+            limit=remaining,
+            send_when_ready=auto_send,
         )
-        result = json.loads(response.body)
-        for key in totals:
-            totals[key] += result[key]
-        if job_id:
-            mark_job(job_id, "running", progress=min(95, 5 + totals["discovered"]))
-        if not auto_send:
-            print(json.dumps(totals))
-            if result["completed"] < remaining:
-                if job_id:
-                    mark_job(job_id, "partial", progress=100, error="Daily preparation target was not met.")
-                return
-            if job_id:
-                mark_job(job_id, "succeeded", progress=100)
-            return
-        if result["discovered"] == 0:
-            print(json.dumps(totals))
-            action = "send" if auto_send else "preparation"
-            if job_id:
-                mark_job(job_id, "partial", progress=100, error=f"Daily {action} target was not met; no new verified leads were available.")
-            return
-        if result["completed"] == 0:
-            # A failed AI/render/send attempt must not prevent trying the next lead.
-            continue
-        if auto_send and settings.environment == "production" and result.get("sent", 0):
-            time.sleep(random.uniform(max(settings.outreach_min_delay_seconds, 0), max(settings.outreach_max_delay_seconds, settings.outreach_min_delay_seconds)))
+        if auto_send and result["sent"] < remaining:
+            status = "partial"
+            error = f"Job-led outreach sent {result['sent']} of {remaining} available daily slots from {result['discovered']} job listings."
+        elif not auto_send and result["completed"] < remaining:
+            status = "partial"
+            error = f"Job-led outreach prepared {result['completed']} campaigns from {result['discovered']} job listings."
+        else:
+            status, error = "succeeded", None
+
+    print(json.dumps(result))
+    if job_id:
+        mark_job(job_id, status, progress=100, error=error)
 
 
 if __name__ == "__main__":

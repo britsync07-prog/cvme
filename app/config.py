@@ -25,7 +25,6 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     resend_from: str = ""
     resend_webhook_secret: str = ""
-    companies_house_api_key: str = ""
     adzuna_app_id: str = ""
     adzuna_app_key: str = ""
     jooble_api_key: str = ""

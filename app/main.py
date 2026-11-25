@@ -39,8 +39,6 @@ from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_pla
 from .services import (
     candidates_from_zip,
     cv_outreach_readiness_error,
-    discover_company_lead,
-    discover_company_leads,
     render_pdf,
     research_company,
     send_email,
@@ -65,8 +63,6 @@ async def lifespan(app: FastAPI):
             settings.signup_enabled = setting_value(db, "signup_enabled").lower() == "true"
         if setting_value(db, "maintenance_mode", ""):
             settings.maintenance_mode = setting_value(db, "maintenance_mode").lower() == "true"
-        if setting_value(db, "companies_house_api_key", ""):
-            settings.companies_house_api_key = setting_value(db, "companies_house_api_key")
         if setting_value(db, "default_daily_limit", ""):
             try:
                 settings.outreach_daily_limit = min(max(int(setting_value(db, "default_daily_limit")), 1), 100)
@@ -300,7 +296,7 @@ def _legal_page(request: Request, page_name: str):
         "privacy": {"title": "Privacy policy", "intro": "This policy explains what TailorJobhunt stores, why it is needed, and the controls available to each workspace.", "sections": [
             {"heading": "Information we process", "paragraphs": ["We process account and workspace details, uploaded CV files, candidate facts, company and lead records, research notes, generated documents, delivery events, support requests, and security/audit events."], "bullets": []},
             {"heading": "Why we process it", "paragraphs": ["We use this information to provide the application workflow, tailor documents, send messages you approve, enforce limits, prevent abuse, provide support, and maintain reliable and secure infrastructure."], "bullets": []},
-            {"heading": "Connected providers", "paragraphs": ["If you connect an AI provider, Gmail, SMTP, Companies House, payment, or delivery provider, the service exchanges only the data needed for the feature you enable. Provider credentials and tokens are encrypted at rest and masked in the interface."], "bullets": []},
+            {"heading": "Connected providers", "paragraphs": ["If you connect an AI provider, Gmail, SMTP, job provider, payment, or delivery provider, the service exchanges only the data needed for the feature you enable. Provider credentials and tokens are encrypted at rest and masked in the interface."], "bullets": []},
             {"heading": "Retention and your rights", "paragraphs": ["You can export or delete workspace data from the account controls. We retain limited security, billing, suppression, and audit records where necessary for legal compliance, fraud prevention, or dispute handling. Contact us to request access, correction, restriction, or deletion."], "bullets": []},
             {"heading": "Security", "paragraphs": ["Workspace records are scoped by workspace ID, sensitive credentials are encrypted, and administrative actions are audit logged. No internet service can promise absolute security; report suspected incidents promptly."], "bullets": []},
             {"heading": "Contact", "paragraphs": ["For privacy requests, email support@ascentraconsulting.co.uk."], "bullets": []},
@@ -1241,10 +1237,7 @@ def sent_emails(request: Request):
 
 @app.get("/leads")
 def leads_page(request: Request):
-    with SessionLocal() as db:
-        workspace, _ = current_workspace(request, db)
-        campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)).order_by(Campaign.created_at.desc())).all()
-    return templates.TemplateResponse(request, "leads.html", {"campaigns": campaigns})
+    return RedirectResponse("/?tab=jobs", status_code=303)
 
 
 @app.get("/support")
@@ -1677,7 +1670,7 @@ def admin_kill_switch(request: Request, enabled: bool = Form()):
 
 
 @app.post("/admin/system/settings")
-def admin_system_settings(request: Request, signup_enabled: bool = Form(False), maintenance_mode: bool = Form(False), companies_house_api_key: str = Form(""), default_daily_limit: int = Form(100), announcement: str = Form("")):
+def admin_system_settings(request: Request, signup_enabled: bool = Form(False), maintenance_mode: bool = Form(False), default_daily_limit: int = Form(100), announcement: str = Form("")):
     with SessionLocal() as db:
         actor = _require_admin(request, db)
         update_settings(signup_enabled=signup_enabled, maintenance_mode=maintenance_mode)
@@ -1685,9 +1678,6 @@ def admin_system_settings(request: Request, signup_enabled: bool = Form(False), 
         set_setting(db, "maintenance_mode", "true" if maintenance_mode else "false")
         set_setting(db, "default_daily_limit", str(min(max(default_daily_limit, 1), 100)))
         set_setting(db, "announcement", announcement.strip()[:2000])
-        if companies_house_api_key.strip():
-            set_setting(db, "companies_house_api_key", companies_house_api_key.strip())
-            settings.companies_house_api_key = companies_house_api_key.strip()
         settings.outreach_daily_limit = min(max(default_daily_limit, 1), 100)
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="system_settings_changed", entity_type="system", detail={"signup_enabled": signup_enabled, "maintenance_mode": maintenance_mode}, ip_address=request.client.host if request.client else None))
         db.commit()
@@ -1763,6 +1753,7 @@ def delete_candidate(request: Request, candidate_id: int):
 def create_campaign(
     request: Request = None,
     workspace_id: int | None = None,
+    job_id: int | None = None,
     candidate_id: int = Form(),
     company_name: str = Form(),
     company_url: str = Form(""),
@@ -1793,6 +1784,7 @@ def create_campaign(
             workspace_id=workspace.id,
             user_id=user.id,
             candidate_id=candidate_id,
+            job_id=job_id,
             company_name=company_name,
             company_url=company_url.strip() or None,
             target_role=target_role.strip() or None,
@@ -1816,29 +1808,7 @@ def create_campaign(
 
 @app.post("/leads/discover")
 def discover_lead(request: Request = None, workspace_id: int | None = None, candidate_id: int = Form(), query: str = Form(), target_role: str = Form("")):
-    with SessionLocal() as db:
-        if request:
-            workspace, _ = current_workspace(request, db)
-        elif workspace_id:
-            workspace = db.get(Workspace, workspace_id)
-        else:
-            workspace, _ = ensure_default_workspace(db)
-        require_owned(db, Candidate, candidate_id, workspace)
-    try:
-        lead = discover_company_lead(query.strip())
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(400, str(exc)) from exc
-    return create_campaign(
-        candidate_id=candidate_id,
-        company_name=lead["company_name"],
-        company_url=lead["company_url"],
-        target_role=target_role,
-        job_description=f"Companies House number: {lead['company_number']}. Public contact sources: {', '.join(lead['source_urls'])}",
-        recipient_email=lead["recipient_email"],
-        auto_prepare=True,
-        request=request,
-        workspace_id=workspace_id,
-    )
+    raise HTTPException(410, "Company-led discovery has been retired. Use the Jobs workflow.")
 
 
 @app.post("/leads/batch")
@@ -1851,53 +1821,7 @@ def discover_lead_batch(
     limit: int = Form(100),
     send_when_ready: bool = Form(False),
 ):
-    limit = min(max(limit, 1), 100)
-    with SessionLocal() as db:
-        if request:
-            workspace, _ = current_workspace(request, db)
-        elif workspace_id:
-            workspace = db.get(Workspace, workspace_id)
-        else:
-            workspace, _ = ensure_default_workspace(db)
-        require_owned(db, Candidate, candidate_id, workspace)
-        existing_names = {name.casefold() for name in db.scalars(select(Campaign.company_name).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))).all()}
-        existing_numbers = {
-            number for description in db.scalars(select(Campaign.job_description).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))).all()
-            for number in re.findall(r"Companies House number: ([A-Z0-9]+)", description or "")
-        }
-        if send_when_ready:
-            try:
-                limit = min(limit, remaining_daily_send_budget(db, workspace.id))
-            except ValueError as exc:
-                raise HTTPException(400, str(exc)) from exc
-    if limit == 0:
-        return JSONResponse({"discovered": 0, "completed": 0, "sent": 0, "message": "Daily send limit reached."})
-    try:
-        leads = discover_company_leads(query.strip(), limit, existing_names, existing_numbers)
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(400, str(exc)) from exc
-
-    completed = 0
-    for lead in leads:
-        try:
-            response = create_campaign(
-                candidate_id=candidate_id,
-                company_name=lead["company_name"],
-                company_url=lead["company_url"],
-                target_role=target_role,
-                job_description=f"Companies House number: {lead['company_number']}. Public contact sources: {', '.join(lead['source_urls'])}",
-                recipient_email=lead["recipient_email"],
-                auto_prepare=True,
-                request=request,
-                workspace_id=workspace_id,
-            )
-            if send_when_ready:
-                campaign_id = int(response.headers["location"].rsplit("/", 1)[-1])
-                send_campaign(campaign_id, approved=True, request=request, workspace_id=workspace_id)
-            completed += 1
-        except HTTPException:
-            continue
-    return JSONResponse({"discovered": len(leads), "completed": completed, "sent": completed if send_when_ready else 0})
+    raise HTTPException(410, "Company-led discovery has been retired. Use the Jobs workflow.")
 
 
 @app.get("/campaigns/{campaign_id}")
@@ -2084,7 +2008,7 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
         db.commit()
         campaign = require_owned(db, Campaign, campaign_id, workspace)
         sender_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
-        if not sender_account and settings.environment == "production":
+        if not sender_account and settings.environment == "production" and not (settings.resend_api_key and settings.resend_from):
             campaign.status = "ready"
             audit(db, campaign, "send_blocked", "Connect a Gmail or SMTP sender for this workspace before sending.", user.id)
             db.commit()
@@ -2165,7 +2089,6 @@ def save_settings(
     smtp_use_tls: bool = Form(False),
     resend_api_key: str = Form(""),
     resend_from: str = Form(""),
-    companies_house_api_key: str = Form(""),
     scrapollo_binary: str = Form("scrapollo"),
     scrapollo_cookie_file: str = Form(""),
     scrapollo_input_file: str = Form(""),
@@ -2221,7 +2144,6 @@ def save_settings(
         smtp_use_tls=smtp_use_tls if is_admin else settings.smtp_use_tls,
         resend_api_key=(resend_api_key.strip() or settings.resend_api_key) if is_admin else settings.resend_api_key,
         resend_from=(resend_from.strip() or settings.resend_from) if is_admin else settings.resend_from,
-        companies_house_api_key=(companies_house_api_key.strip() or settings.companies_house_api_key) if is_admin else settings.companies_house_api_key,
         scrapollo_binary=scrapollo_binary.strip() or "scrapollo",
         scrapollo_cookie_file=scrapollo_cookie_file.strip() or settings.scrapollo_cookie_file,
         scrapollo_input_file=scrapollo_input_file.strip() or settings.scrapollo_input_file,

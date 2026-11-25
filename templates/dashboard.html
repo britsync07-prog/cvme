@@ -31,7 +31,6 @@
     <a href="/?tab=new" class="tab-item {% if active_tab == 'new' %}active{% endif %}">
       New Application
     </a>
-    <a href="/?tab=leads" class="tab-item {% if active_tab == 'leads' %}active{% endif %}">Lead discovery</a>
     <a href="/?tab=jobs" class="tab-item {% if active_tab == 'jobs' %}active{% endif %}">Jobs</a>
     <a href="/?tab=candidates" class="tab-item {% if active_tab == 'candidates' %}active{% endif %}">
       Candidates
@@ -214,45 +213,6 @@
         <p>You need to add at least one candidate CV before launching an application.</p>
         <a href="/?tab=candidates" class="button primary">Add Candidates Now</a>
       </div>
-      {% endif %}
-    </div>
-
-    {% elif active_tab == 'leads' %}
-    <div class="panel form-panel">
-      <div class="panel-header">
-        <div>
-          <h1>Discover a UK company lead</h1>
-          <p class="subtitle">Companies House finds an active company. DuckDuckGo and public company pages find its official website and published generic mailbox.</p>
-        </div>
-      </div>
-      {% if candidates %}
-      <form action="/leads/discover" method="post" class="standard-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <div class="form-row">
-          <label class="field"><span>Candidate</span><select name="candidate_id" required>{% for c in candidates %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></label>
-          <label class="field"><span>Companies House search</span><input name="query" placeholder="e.g. software, consulting, engineering" required></label>
-        </div>
-        <label class="field"><span>Target role</span><input name="target_role" placeholder="e.g. Software Engineer"></label>
-        <button type="submit" class="button primary">Discover, research, and prepare</button>
-      </form>
-
-      <form action="/leads/batch" method="post" class="standard-form">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
-        <h2>Prepare a daily batch</h2>
-          <p class="subtitle">Creates up to 100 new company campaigns from Companies House queries. Separate alternative searches with semicolons; existing company names and numbers are skipped.</p>
-        <div class="form-row">
-          <label class="field"><span>Candidate</span><select name="candidate_id" required>{% for c in candidates %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></label>
-          <label class="field"><span>Companies House search</span><input name="query" placeholder="e.g. software, consulting, engineering" required></label>
-        </div>
-        <div class="form-row">
-          <label class="field"><span>Target role</span><input name="target_role" placeholder="e.g. Software Engineer"></label>
-          <label class="field"><span>Maximum campaigns</span><input name="limit" type="number" min="1" max="100" value="100"></label>
-        </div>
-        <label class="checkbox-label"><input type="checkbox" name="send_when_ready" value="true"><span>Send each campaign after it is prepared.</span></label>
-        <button type="submit" class="button primary">Run batch</button>
-      </form>
-      {% else %}
-      <p>Add a candidate first. A candidate CV is required before a tailored application can be created.</p>
       {% endif %}
     </div>
 
@@ -476,19 +436,13 @@
         </div>
 
         <div class="settings-section">
-          <h3>UK company discovery</h3>
-          <p class="subtitle">Uses the free Companies House API plus DuckDuckGo and public company websites. No paid search API is required.</p>
-          <label class="field"><span>Companies House REST API key</span><input name="companies_house_api_key" type="password" value="" placeholder="{{ 'Configured — enter a new key to rotate' if settings.companies_house_api_key else '' }}"></label>
-        </div>
-
-        <div class="settings-section">
           <h3>Public web research</h3>
           <p class="subtitle">Research comes from the public company website and its published contact pages.</p>
         </div>
 
         <div class="settings-section">
           <h3>Lead intake and outreach policy</h3>
-          <p class="subtitle">The scheduled runner uses Companies House, DuckDuckGo, public company websites, your local AI endpoint, RenderCV, and your configured email sender.</p>
+          <p class="subtitle">The scheduled runner searches supported job sources, finds public employer contacts, tailors your CV with AI, renders it with RenderCV, and uses your configured email sender.</p>
           <div class="form-row">
             <label class="field">
               <span>Scheduled candidate</span>
@@ -501,8 +455,8 @@
           </div>
           <div class="form-row">
             <label class="field">
-              <span>Companies House query</span>
-              <input name="outreach_query" value="{{ workspace.outreach_query }}" placeholder="e.g. software, consulting, engineering">
+              <span>Job-search keywords</span>
+              <input name="outreach_query" value="{{ workspace.outreach_query }}" placeholder="e.g. backend engineer, software developer">
             </label>
             <label class="field">
               <span>Target role</span>

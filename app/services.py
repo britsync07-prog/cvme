@@ -8,7 +8,6 @@ import socket
 import subprocess
 import sys
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from io import BytesIO
@@ -24,10 +23,7 @@ from .security import decrypt_secret, encrypt_secret
 
 LLM_TIMEOUT_SECONDS = 300
 LLM_REQUEST_ATTEMPTS = 5
-COMPANIES_HOUSE_URL = "https://api.company-information.service.gov.uk"
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
-GENERIC_MAILBOXES = {"careers", "jobs", "hr", "recruitment", "talent", "hiring", "people", "contact", "hello", "info", "help", "support"}
-DISCOVERY_WORKERS = 6  # shortcut: bounded public-web fetching, raise only with provider rate-limit monitoring.
 
 
 def _llm_url(base_url: str, endpoint: str) -> str:
@@ -140,93 +136,6 @@ def _search_web(query: str) -> list[str]:
         if results:
             return results
     return []
-
-
-def _companies_house_results(query: str, limit: int, start_index: int = 0) -> list[dict]:
-    if not settings.companies_house_api_key:
-        raise ValueError("COMPANIES_HOUSE_API_KEY is required for company discovery.")
-    response = httpx.get(
-        f"{COMPANIES_HOUSE_URL}/search/companies", params={"q": query, "items_per_page": limit, "start_index": start_index},
-        auth=(settings.companies_house_api_key, ""), timeout=20,
-    )
-    response.raise_for_status()
-    return [item for item in response.json().get("items", []) if item.get("company_status") == "active"]
-
-
-def _discover_company_record(company: dict) -> dict:
-    name = company["title"]
-    website = next(
-        (url for url in _search_web(f"{name} official website") if urlparse(url).hostname not in {"find-and-update.company-information.service.gov.uk", "duckduckgo.com"}),
-        None,
-    )
-    if not website:
-        raise ValueError("Could not find a public company website.")
-    site_url, page = _website_text(website)
-    parsed = urlparse(site_url)
-    pages = [(site_url, page)]
-    for suffix in ("/contact", "/contact-us", "/careers"):
-        try:
-            pages.append(_website_text(f"{parsed.scheme}://{parsed.netloc}{suffix}"))
-        except (httpx.HTTPError, ValueError):
-            continue
-    emails = {email.lower() for _, text in pages for email in EMAIL_RE.findall(text.replace("\\u003e", ">"))}
-    generic = sorted(
-        (email for email in emails if email.split("@", 1)[0] in GENERIC_MAILBOXES),
-        key=lambda email: (email.split("@", 1)[0] not in {"careers", "jobs", "hr", "recruitment"}, email),
-    )
-    if not generic:
-        raise ValueError("Company website has no published generic contact email.")
-    return {"company_name": name, "company_number": company.get("company_number", ""), "company_url": site_url, "recipient_email": generic[0], "source_urls": [url for url, _ in pages]}
-
-
-def discover_company_lead(query: str) -> dict:
-    """Find one active UK company and a published generic contact address."""
-    terms = [term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 2]
-    companies = _companies_house_results(query, 20)
-    company = max(companies, key=lambda item: sum(term in item.get("title", "").lower() for term in terms), default=None)
-    if not company or not any(term in company.get("title", "").lower() for term in terms):
-        raise ValueError("No active Companies House result found.")
-    return _discover_company_record(company)
-
-
-def discover_company_leads(
-    query: str,
-    limit: int,
-    existing_names: set[str] | None = None,
-    existing_numbers: set[str] | None = None,
-) -> list[dict]:
-    """Find up to ``limit`` new, active UK companies with published generic contact addresses."""
-    existing_names = existing_names or set()
-    existing_numbers = existing_numbers or set()
-    leads: list[dict] = []
-    seen_numbers: set[str] = set()
-    for term in (part.strip() for part in re.split(r"[;\n]+", query) if part.strip()):
-        for start_index in range(0, 500, 100):
-            companies = _companies_house_results(term, 100, start_index)
-            if not companies:
-                break
-            candidates = []
-            for company in companies:
-                number = company.get("company_number", "")
-                if company.get("title", "").casefold() in existing_names or number in existing_numbers or number in seen_numbers:
-                    continue
-                seen_numbers.add(number)
-                candidates.append(company)
-            for offset in range(0, len(candidates), DISCOVERY_WORKERS):
-                batch = candidates[offset:offset + DISCOVERY_WORKERS]
-                def discover_or_none(company: dict) -> dict | None:
-                    try:
-                        return _discover_company_record(company)
-                    except (httpx.HTTPError, ValueError):
-                        return None
-                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                    for future in as_completed([executor.submit(discover_or_none, company) for company in batch]):
-                        lead = future.result()
-                        if lead:
-                            leads.append(lead)
-                            if len(leads) == limit:
-                                return leads
-    return leads
 
 
 def research_company(

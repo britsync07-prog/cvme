@@ -15,4 +15,4 @@
 
 ## External launch gates
 
-Stripe live prices/webhook, Google OAuth consent and Gmail-scope verification, Resend domain/DNS/webhook secret, Companies House key, sender credentials, Sentry, backup storage/restore drill, and the operator's PECR/GDPR lawful-basis review remain deployment configuration steps.
+Stripe live prices/webhook, Google OAuth consent and Gmail-scope verification, Resend domain/DNS/webhook secret, job-provider credentials where enabled, sender credentials, Sentry, backup storage/restore drill, and the operator's PECR/GDPR lawful-basis review remain deployment configuration steps.

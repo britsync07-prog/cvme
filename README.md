@@ -22,7 +22,7 @@ flowchart LR
 2. **Company & Role Research**:
    - Analyzes target company website, mission, and required tech stack.
    - Incorporates custom job descriptions and role requirements.
-   - Uses the free Companies House API, DuckDuckGo, and public company websites for discovery and contact research.
+   - Uses supported job sources plus public employer websites for job and contact research.
 3. **Truthful LLM Tailoring**:
    - Calls your configured OpenAI-compatible endpoint.
    - Strict hallucination guardrails: preserves candidate identity, degrees, employment history, and factual details while tailoring wording to match the company's culture and role.
@@ -77,13 +77,13 @@ SMTP_USE_TLS=true
 
 ### 3. Schedule the free daily batch
 
-Set `COMPANIES_HOUSE_API_KEY`, `OUTREACH_CANDIDATE_ID`, `OUTREACH_QUERY`, and `OUTREACH_TARGET_ROLE` in the production environment. The runner uses only Companies House, DuckDuckGo, public websites, your configured AI endpoint, local RenderCV, and your configured mail provider.
+Set `OUTREACH_CANDIDATE_ID`, `OUTREACH_QUERY`, and `OUTREACH_TARGET_ROLE` in the production environment. The runner uses enabled job providers, public employer websites, your configured AI endpoint, local RenderCV, and your configured mail provider.
 
 ```bash
 python -m app.daily_outreach
 ```
 
-Run that command once per day using your host scheduler (for example, Windows Task Scheduler). It prepares up to `OUTREACH_DAILY_LIMIT=100` unique companies, pages through Companies House results, and skips companies already recorded by name or company number. Use semicolons in `OUTREACH_QUERY` to try several search terms. The timezone-aware send budget prevents more than the configured daily limit from being sent, even if the runner is triggered twice. Set `OUTREACH_AUTO_SEND=true` only after verifying the workflow and sender compliance; otherwise campaigns remain `ready` for dashboard review. Before crawling, the worker verifies the candidate, CV quality, sender, AI, discovery key, timezone, and 100-per-day target; it exits nonzero if the target is missed.
+Run that command once per day using your host scheduler (for example, Windows Task Scheduler). It searches enabled job providers with `OUTREACH_QUERY`, deduplicates listings, finds only public role/generic employer mailboxes, prepares a job-specific CV and email, and skips listings already linked to a campaign. The timezone-aware send budget prevents more than the configured daily limit from being sent, even if the runner is triggered twice. Set `OUTREACH_AUTO_SEND=true` only after verifying the workflow and sender compliance; otherwise campaigns remain `ready` for dashboard review.
 
 On Windows, install the daily task after configuring the production environment:
 

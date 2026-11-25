@@ -1,6 +1,7 @@
 """Small Redis-backed job runner for long outreach operations."""
 import json
 import logging
+import time
 import redis
 
 from .config import settings
@@ -16,6 +17,7 @@ def run() -> None:
     while True:
         _, payload = client.brpop("tailormail:jobs")
         lock_key = None
+        lock_acquired = False
         job = {}
         try:
             job = json.loads(payload)
@@ -28,7 +30,15 @@ def run() -> None:
                 mark_job(int(job_id), "running", progress=1, attempts=int(job.get("attempts", 0)))
             lock_key = f"tailormail:running:{job.get('type')}:{job.get('workspace_id', 'global')}"
             if not client.set(lock_key, "1", nx=True, ex=7200):
+                # Another worker owns this job type. Preserve the durable job
+                # and queue payload; never leave it falsely marked running at
+                # 1% or delete another worker's lock.
+                if job_id:
+                    mark_job(int(job_id), "queued", progress=0)
+                client.lpush("tailormail:jobs", json.dumps(job))
+                time.sleep(1)
                 continue
+            lock_acquired = True
             if job.get("type") == "daily_outreach":
                 from .daily_outreach import main
                 main(job.get("workspace_id"), job_id=job_id)
@@ -57,7 +67,7 @@ def run() -> None:
             except Exception:
                 log.exception("Could not requeue failed job")
         finally:
-            if lock_key:
+            if lock_key and lock_acquired:
                 client.delete(lock_key)
 
 

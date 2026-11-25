@@ -24,6 +24,9 @@ from .security import decrypt_secret, encrypt_secret
 LLM_TIMEOUT_SECONDS = 60
 LLM_REQUEST_ATTEMPTS = 2
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+RESEARCH_SOURCE_MAX_CHARS = 3_000
+RESEARCH_MAX_SOURCES = 3
+JOB_CONTEXT_MAX_CHARS = 6_000
 
 
 def _llm_url(base_url: str, endpoint: str) -> str:
@@ -153,16 +156,26 @@ def research_company(
     """Collect public facts and job context without hallucination."""
     sources: list[dict[str, str]] = []
 
+    def add_source(url: str, content: str) -> None:
+        """Keep the tailoring prompt focused enough for a reliable response.
+
+        The previous 4 x 12k-character scrape could create a 20k+ token AI
+        request.  That made the selected provider routinely stall for minutes
+        and blocked every later daily outreach email.
+        """
+        if len(sources) < RESEARCH_MAX_SOURCES:
+            sources.append({"url": url, "content": content[:RESEARCH_SOURCE_MAX_CHARS]})
+
     if website:
         try:
             website_url, text = _website_text(website)
-            sources.append({"url": website_url, "content": text[:12000]})
+            add_source(website_url, text)
             website_host = urlparse(website_url).hostname
             # Collect evidence about both the business and what it hires for.
             seen_sources = {website_url}
             parsed_website = urlparse(website_url)
             for suffix in ("/contact", "/contact-us", "/careers"):
-                if len(sources) >= 4:
+                if len(sources) >= RESEARCH_MAX_SOURCES:
                     break
                 try:
                     contact_url, contact_text = _website_text(f"{parsed_website.scheme}://{parsed_website.netloc}{suffix}")
@@ -170,7 +183,7 @@ def research_company(
                     continue
                 if contact_url not in seen_sources:
                     seen_sources.add(contact_url)
-                    sources.append({"url": contact_url, "content": contact_text[:12000]})
+                    add_source(contact_url, contact_text)
             research_queries = [
                 f"{name} company services technology",
                 f"{name} careers jobs hiring {target_role or ''}",
@@ -178,7 +191,7 @@ def research_company(
             ]
             for query in research_queries:
                 for result_url in _search_web(query):
-                    if len(sources) >= 4 or urlparse(result_url).hostname == website_host:
+                    if len(sources) >= RESEARCH_MAX_SOURCES or urlparse(result_url).hostname == website_host:
                         continue
                     try:
                         source_url, source_text = _website_text(result_url)
@@ -186,12 +199,12 @@ def research_company(
                         continue
                     if source_url not in seen_sources:
                         seen_sources.add(source_url)
-                        sources.append({"url": source_url, "content": source_text[:12000]})
+                        add_source(source_url, source_text)
         except ValueError as exc:
             if "public IP" in str(exc) or "http" in str(exc):
                 raise
             if job_description or target_role:
-                sources.append({"url": website, "content": f"DNS note: {exc}. Using provided job specifications."})
+                add_source(website, f"DNS note: {exc}. Using provided job specifications.")
             else:
                 raise
         except httpx.HTTPError as exc:
@@ -201,12 +214,12 @@ def research_company(
                 raise ValueError(f"Failed to fetch company website: {exc}") from exc
 
     elif job_description or target_role:
-        sources.append({"url": "user-input", "content": job_description or f"Target Role: {target_role}"})
+        add_source("user-input", job_description or f"Target Role: {target_role}")
     else:
         raise ValueError("Provide a company website or target role/job description.")
 
     if job_description and not any(s.get("url") == "user-input" for s in sources):
-        sources.append({"url": "user-input", "content": job_description})
+        add_source("user-input", job_description[:JOB_CONTEXT_MAX_CHARS])
 
     return {
         "company": name,

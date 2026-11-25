@@ -141,7 +141,7 @@ def discover_job_batch(
                 company_name=job.company_name,
                 company_url=job.company_website or job.apply_url,
                 target_role=target_role or job.title,
-                job_description=job.description or f"Job listing: {job.apply_url}",
+                job_description=(job.description or f"Job listing: {job.apply_url}") + f"\n\nPublic employer contact source: {contact['source_url']}\nVerified recipient: {contact['email']}",
                 recipient_email=contact["email"],
                 auto_prepare=True,
             )

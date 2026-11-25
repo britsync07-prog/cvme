@@ -382,7 +382,7 @@ def test_scheduled_job_batch_prepares_and_sends_a_verified_employer_contact(monk
     created, sent = [], []
     monkeypatch.setattr(daily_outreach, "aggregate_search", aggregate)
     monkeypatch.setattr(daily_outreach, "_persist_jobs", lambda *args: [job])
-    monkeypatch.setattr(daily_outreach, "find_public_company_contacts", lambda *args: [{"email": "careers@acme.example", "verified_mx": True}])
+    monkeypatch.setattr(daily_outreach, "find_public_company_contacts", lambda *args: [{"email": "careers@acme.example", "source_url": "https://acme.example/careers", "verified_mx": True}])
     monkeypatch.setattr(daily_outreach, "create_campaign", lambda **kwargs: (created.append(kwargs) or RedirectResponse("/campaigns/77", status_code=303)))
     monkeypatch.setattr(daily_outreach, "send_campaign", lambda campaign_id, **kwargs: sent.append((campaign_id, kwargs)))
 
@@ -398,6 +398,7 @@ def test_scheduled_job_batch_prepares_and_sends_a_verified_employer_contact(monk
     assert searches[0].keywords == "backend engineer"
     assert created[0]["job_id"] == 99
     assert created[0]["recipient_email"] == "careers@acme.example"
+    assert "careers@acme.example" in created[0]["job_description"]
     assert sent == [(77, {"approved": True, "workspace_id": workspace_id})]
     assert result == {"discovered": 1, "completed": 1, "sent": 1}
 

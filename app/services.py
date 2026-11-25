@@ -21,8 +21,8 @@ from .config import settings
 from .security import decrypt_secret, encrypt_secret
 
 
-LLM_TIMEOUT_SECONDS = 300
-LLM_REQUEST_ATTEMPTS = 5
+LLM_TIMEOUT_SECONDS = 60
+LLM_REQUEST_ATTEMPTS = 2
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 
 
@@ -35,12 +35,18 @@ def _llm_url(base_url: str, endpoint: str) -> str:
 
 
 def _llm_request(request, *args, **kwargs) -> httpx.Response:
-    """Retry transport failures from slow or temporarily unavailable providers."""
-    for attempt in range(LLM_REQUEST_ATTEMPTS):
+    """Use a bounded number of bounded AI-provider attempts.
+
+    Outreach is a batch process: one provider stall must fail that campaign
+    and let the worker continue researching the next verified employer.
+    """
+    timeout = max(1, settings.llm_timeout_seconds)
+    attempts = max(1, settings.llm_request_attempts)
+    for attempt in range(attempts):
         try:
-            return request(*args, timeout=LLM_TIMEOUT_SECONDS, **kwargs)
+            return request(*args, timeout=timeout, **kwargs)
         except httpx.RequestError:
-            if attempt == LLM_REQUEST_ATTEMPTS - 1:
+            if attempt == attempts - 1:
                 raise
     raise RuntimeError("Unreachable")
 
@@ -375,14 +381,15 @@ Original RenderCV YAML:
 
     result = None
     last_error = None
-    for attempt in range(LLM_REQUEST_ATTEMPTS):
+    attempts = max(1, settings.llm_request_attempts)
+    for attempt in range(attempts):
         try:
             result = _clean_json_response(_llm_content(response))
             break
         except (json.JSONDecodeError, ValueError) as exc:
             last_error = exc
-            if attempt == LLM_REQUEST_ATTEMPTS - 1:
-                raise ValueError("AI returned invalid JSON after five attempts.") from exc
+            if attempt == attempts - 1:
+                raise ValueError("AI returned invalid JSON after the configured retry limit.") from exc
             response = _llm_request(httpx.post, url, headers=headers, json=payload)
             response.raise_for_status()
     if result is None:

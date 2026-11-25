@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     enable_remotejobs_reference: bool = False
     job_cache_ttl_seconds: int = 900
     job_provider_timeout_seconds: int = 30
+    # A daily outreach batch must keep moving when an AI provider is slow or
+    # unavailable.  These bounds apply to each CV/email tailoring attempt.
+    llm_timeout_seconds: int = 60
+    llm_request_attempts: int = 2
     contact_cooldown_days: int = 30
     scrapollo_binary: str = "scrapollo"
     scrapollo_cookie_file: str = ""

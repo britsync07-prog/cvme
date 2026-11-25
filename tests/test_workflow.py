@@ -19,6 +19,7 @@ from app.db import Base, SessionLocal, engine
 from app.main import app
 import app.main as main
 from app.models import Campaign, Candidate
+from app.tenancy import ensure_default_workspace
 
 
 @pytest.fixture(autouse=True)
@@ -334,6 +335,7 @@ def _outreach_ready_candidate_id() -> int:
 def _configure_daily_worker(monkeypatch, candidate_id: int) -> None:
     monkeypatch.setattr(daily_outreach.settings, "outreach_candidate_id", candidate_id)
     monkeypatch.setattr(daily_outreach.settings, "outreach_query", "software")
+    monkeypatch.setattr(daily_outreach.settings, "outreach_target_role", "Backend Engineer")
     monkeypatch.setattr(daily_outreach.settings, "outreach_daily_limit", 100)
     monkeypatch.setattr(daily_outreach.settings, "outreach_auto_send", True)
     monkeypatch.setattr(daily_outreach.settings, "companies_house_api_key", "test-key")
@@ -362,6 +364,41 @@ def test_daily_worker_stops_for_missing_candidate(monkeypatch):
 
     with pytest.raises(SystemExit, match="candidate was not found"):
         daily_outreach.main()
+
+
+def test_daily_worker_uses_platform_defaults_for_an_empty_workspace(monkeypatch):
+    candidate_id = _outreach_ready_candidate_id()
+    _configure_daily_worker(monkeypatch, candidate_id)
+    with SessionLocal() as db:
+        workspace, _ = ensure_default_workspace(db)
+        candidate = db.get(Candidate, candidate_id)
+        candidate.workspace_id = workspace.id
+        workspace.outreach_candidate_id = None
+        workspace.outreach_query = ""
+        workspace.outreach_target_role = ""
+        workspace.outreach_auto_send = True
+        db.commit()
+        workspace_id = workspace.id
+
+    calls = []
+    monkeypatch.setattr(
+        daily_outreach,
+        "discover_lead_batch",
+        lambda **kwargs: (calls.append(kwargs) or JSONResponse({"discovered": 1, "completed": 1, "sent": 1})),
+    )
+    remaining = iter([1, 0])
+    monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda *args: next(remaining))
+
+    daily_outreach.main(workspace_id=workspace_id)
+
+    assert calls == [{
+        "candidate_id": candidate_id,
+        "query": "software",
+        "target_role": "Backend Engineer",
+        "limit": 1,
+        "send_when_ready": True,
+        "workspace_id": workspace_id,
+    }]
 
 
 def test_daily_preflight_requires_sender_for_auto_send(monkeypatch):

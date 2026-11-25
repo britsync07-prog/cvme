@@ -54,7 +54,7 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
     if workspace_auto_send:
         with SessionLocal() as db:
             sender = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == (workspace_id or (ensure_default_workspace(db)[0].id)), EmailAccount.status == "active"))
-        if not sender and (workspace_id or not (settings.resend_api_key and settings.resend_from)):
+        if not sender and not (settings.resend_api_key and settings.resend_from):
             errors.append("Configured automatic sending requires Resend or SMTP / a connected workspace sender.")
     try:
         ZoneInfo(configured_timezone)
@@ -107,9 +107,14 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
             return
         with SessionLocal() as db:
             workspace = db.get(Workspace, workspace_id) if workspace_id else ensure_default_workspace(db)[0]
-            candidate_id = workspace.outreach_candidate_id if workspace_id else settings.outreach_candidate_id
-            query = workspace.outreach_query if workspace_id else settings.outreach_query
-            target_role = workspace.outreach_target_role if workspace_id else settings.outreach_target_role
+            # A workspace may deliberately override the platform defaults.  For
+            # older/default workspaces, however, empty fields must inherit the
+            # configured production values just as the preflight check does.
+            # Without this fallback the scheduler passes preflight but discovers
+            # no usable leads because it calls the batch with empty parameters.
+            candidate_id = (workspace.outreach_candidate_id or settings.outreach_candidate_id) if workspace_id else settings.outreach_candidate_id
+            query = (workspace.outreach_query or settings.outreach_query) if workspace_id else settings.outreach_query
+            target_role = (workspace.outreach_target_role or settings.outreach_target_role) if workspace_id else settings.outreach_target_role
             auto_send = bool(getattr(workspace, "outreach_auto_send", settings.outreach_auto_send)) if workspace_id else settings.outreach_auto_send
         response = discover_lead_batch(
             candidate_id=candidate_id,

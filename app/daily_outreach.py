@@ -140,7 +140,9 @@ def discover_job_batch(
             continue
 
         try:
-            contacts = find_public_company_contacts(job["company_name"], job["company_website"], job["apply_url"])
+            contacts = find_public_company_contacts(
+                job["company_name"], job["company_website"], job["apply_url"], job["description"],
+            )
         except (ValueError, OSError):
             continue
         contact = next((item for item in contacts if item.get("verified_mx")), None)

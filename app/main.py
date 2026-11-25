@@ -1109,7 +1109,7 @@ def find_job_contact(request: Request, job_id: int):
     with SessionLocal() as db:
         workspace, user = current_workspace(request, db)
         job = require_owned(db, Job, job_id, workspace)
-        found = find_public_company_contacts(job.company_name, job.company_website, job.apply_url)
+        found = find_public_company_contacts(job.company_name, job.company_website, job.apply_url, job.description)
         contacts = []
         for item in found:
             contact = db.scalar(select(CompanyContact).where(CompanyContact.workspace_id == workspace.id, CompanyContact.job_id == job.id, CompanyContact.email == item["email"]))

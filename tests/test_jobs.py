@@ -62,9 +62,38 @@ def test_partial_provider_failure_is_returned(monkeypatch):
 
 def test_contact_ranking_and_public_domain_only():
     assert jobs.rank_contact("careers@acme.example", "acme.example")[1] == "role"
+    assert jobs.rank_contact("recruiting-emea@acme.example", "acme.example")[1] == "role"
     assert jobs.rank_contact("person@acme.example", "acme.example")[0] == 0
     assert jobs.is_job_board_domain("www.linkedin.com") is True
     assert jobs.is_job_board_domain("careers.acme.example") is False
+
+
+def test_company_domain_uses_only_name_matched_official_search_results(monkeypatch):
+    monkeypatch.setattr(jobs, "_search_web", lambda query: [
+        "https://directory.example/acme",
+        "https://acme.example/careers",
+    ])
+    domain, site = jobs.company_domain(None, "https://linkedin.com/jobs/123", "Acme")
+    assert domain == "acme.example"
+    assert site == "https://acme.example/careers"
+
+
+def test_company_domain_verifies_a_derived_company_site(monkeypatch):
+    monkeypatch.setattr(jobs, "_search_web", lambda query: [])
+    monkeypatch.setattr(jobs, "_website_text", lambda url: (url, "Welcome to Acme. Acme builds software."))
+    domain, site = jobs.company_domain(None, "https://linkedin.com/jobs/123", "Acme")
+    assert domain == "acme.com"
+    assert site == "https://acme.com"
+
+
+def test_contact_research_uses_public_role_address_from_job_listing(monkeypatch):
+    monkeypatch.setattr(jobs, "company_domain", lambda *args: (None, None))
+    monkeypatch.setattr(jobs, "verify_mx", lambda email: email == "recruiting-emea@acme.example")
+    found = jobs.find_public_company_contacts(
+        "Acme", None, "https://jobs.example/acme", "Apply at recruiting-emea@acme.example. Ask jane@acme.example for help.",
+    )
+    assert [item["email"] for item in found] == ["recruiting-emea@acme.example"]
+    assert found[0]["source_url"] == "https://jobs.example/acme"
 
 
 def test_contact_research_stores_only_ranked_public_addresses(monkeypatch):

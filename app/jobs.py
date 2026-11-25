@@ -30,7 +30,14 @@ USER_AGENT = "TailorJobhunt Job Search/1.0 (+https://out.ascentraconsulting.co.u
 JOB_BOARD_DOMAINS = {
     "linkedin.com", "indeed.com", "glassdoor.com", "adzuna.com", "jooble.org",
     "remotive.com", "arbeitnow.com", "jobicy.com", "themuse.com", "himalayas.app",
-    "ziprecruiter.com", "google.com",
+    "ziprecruiter.com", "google.com", "greenhouse.io", "lever.co", "workable.com",
+    "ashbyhq.com", "smartrecruiters.com", "teamtailor.com", "bamboohr.com",
+    "icims.com", "jobvite.com",
+}
+NON_EMPLOYER_DOMAINS = {
+    "wikipedia.org", "facebook.com", "instagram.com", "x.com", "twitter.com",
+    "youtube.com", "tiktok.com", "crunchbase.com", "pitchbook.com", "yelp.com",
+    "dnb.com", "zoominfo.com", "glassdoor.co.uk",
 }
 COUNTRY_ALIASES = {
     "uk": "GB", "united kingdom": "GB", "great britain": "GB", "england": "GB",
@@ -41,7 +48,7 @@ COUNTRY_ALIASES = {
     "poland": "PL", "sweden": "SE", "norway": "NO", "denmark": "DK",
     "finland": "FI", "japan": "JP", "singapore": "SG", "new zealand": "NZ",
 }
-ROLE_CONTACTS = ("careers", "jobs", "recruitment", "hr", "talent", "hiring", "people")
+ROLE_CONTACTS = ("careers", "jobs", "recruitment", "recruiting", "hr", "talent", "hiring", "people")
 GENERIC_CONTACTS = {"info", "hello", "contact"}
 _cache: dict[str, tuple[float, list["NormalizedJob"]]] = {}
 _last_call: dict[str, float] = {}
@@ -522,15 +529,86 @@ def is_job_board_domain(domain: str | None) -> bool:
     return any(host == item or host.endswith("." + item) for item in JOB_BOARD_DOMAINS)
 
 
+def _is_company_research_domain(domain: str | None) -> bool:
+    host = (domain or "").casefold().removeprefix("www.")
+    return bool(host) and not is_job_board_domain(host) and not any(host == item or host.endswith("." + item) for item in NON_EMPLOYER_DOMAINS)
+
+
+def _company_tokens(company_name: str) -> list[str]:
+    return [token for token in re.findall(r"[a-z0-9]+", company_name.casefold()) if len(token) > 2 and token not in {"the", "and", "for", "ltd", "limited", "inc", "llc", "plc", "group"}]
+
+
+def _company_site_score(url: str, company_name: str) -> int:
+    """Score only likely official-company results; never select a directory by accident."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    if not _is_company_research_domain(host):
+        return 0
+    tokens = _company_tokens(company_name)
+    if not tokens:
+        return 0
+    compact_host = re.sub(r"[^a-z0-9]", "", host)
+    compact_name = "".join(tokens)
+    if compact_name and compact_name in compact_host:
+        return 100
+    matches = sum(token in compact_host for token in tokens)
+    # A search result is usable only when the host identifies every meaningful
+    # part of the employer name. One token (for example "Cambridge") is not
+    # enough and leads to unrelated sites.
+    return 85 if matches == len(tokens) else 0
+
+
+def _search_company_pages(company_name: str) -> list[str]:
+    pages: list[str] = []
+    seen: set[str] = set()
+    for query in (f"{company_name} official company website", f"{company_name} careers"):
+        for page in _search_web(query):
+            canonical = canonical_url(page)
+            if canonical and canonical not in seen:
+                seen.add(canonical)
+                pages.append(canonical)
+    return pages
+
+
+def _derived_company_sites(company_name: str) -> list[str]:
+    """Conservative fallback for brands whose job board only exposes a name."""
+    slug = "".join(_company_tokens(company_name))
+    if len(slug) < 4:
+        return []
+    return [f"https://{slug}{suffix}" for suffix in (".com", ".co.uk", ".io", ".ai")]
+
+
+def _page_mentions_company(text: str, company_name: str) -> bool:
+    compact_text = re.sub(r"[^a-z0-9]", "", text.casefold())
+    tokens = _company_tokens(company_name)
+    return bool(tokens) and all(token in compact_text for token in tokens)
+
+
 def company_domain(company_website: str | None, apply_url: str | None, company_name: str) -> tuple[str | None, str | None]:
     for value in (company_website, apply_url):
         parsed = urlparse(value or "")
-        if parsed.hostname and not is_job_board_domain(parsed.hostname):
+        if parsed.hostname and _is_company_research_domain(parsed.hostname):
             return parsed.hostname.casefold().removeprefix("www."), value
-    for candidate in _search_web(f"{company_name} official website"):
+    candidates = _search_company_pages(company_name)
+    scored = sorted(((_company_site_score(candidate, company_name), candidate) for candidate in candidates), reverse=True)
+    for score, candidate in scored:
+        if not score:
+            continue
         parsed = urlparse(candidate)
-        if parsed.hostname and not is_job_board_domain(parsed.hostname):
+        if parsed.hostname:
             return parsed.hostname.casefold().removeprefix("www."), candidate
+    # When a job board provides only a company name and search has no reliable
+    # result, test the common company-domain forms. A domain is accepted only
+    # when its own public page identifies the employer; this is not email
+    # guessing and avoids sending to a similarly named site.
+    for candidate in _derived_company_sites(company_name):
+        try:
+            source_url, text = _website_text(candidate)
+        except (ValueError, httpx.HTTPError):
+            continue
+        parsed = urlparse(source_url)
+        if parsed.hostname and _is_company_research_domain(parsed.hostname) and _page_mentions_company(text, company_name):
+            return parsed.hostname.casefold().removeprefix("www."), source_url
     return None, None
 
 
@@ -581,31 +659,70 @@ def rank_contact(email: str, domain: str) -> tuple[int, str]:
         return 100 - ROLE_CONTACTS.index(local), "role"
     if local in GENERIC_CONTACTS:
         return 55, "generic"
+    # Published regional/team aliases such as careers-uk@ or
+    # recruiting.emea@ are role mailboxes, not individual addresses.
+    normalized = re.sub(r"[^a-z]", "", local)
+    if any(term in normalized for term in ("career", "recruit", "talent", "hiring", "job", "humanresources")):
+        return 80, "role"
     return 0, "personal"
 
 
-def find_public_company_contacts(company_name: str, company_website: str | None, apply_url: str | None) -> list[dict[str, Any]]:
+def find_public_company_contacts(
+    company_name: str,
+    company_website: str | None,
+    apply_url: str | None,
+    job_description: str | None = None,
+) -> list[dict[str, Any]]:
     """Respect robots and return only public generic/role addresses with sources."""
-    domain, site = company_domain(company_website, apply_url, company_name)
-    if not domain or not site:
-        return []
-    parsed = urlparse(site)
-    root = f"{parsed.scheme}://{parsed.netloc}"
-    candidates = [root, *[urljoin(root + "/", path) for path in ("contact", "careers", "jobs", "about", "team")]]
     results: dict[str, dict[str, Any]] = {}
-    for page in candidates:
-        if not _robots_allows(page):
-            continue
-        try:
-            source_url, text = _website_text(page)
-        except (ValueError, httpx.HTTPError):
-            continue
+
+    def add_contacts(text: str, domain: str, source_url: str) -> None:
         for email in {match.casefold() for match in EMAIL_RE.findall(text.replace("\\u003e", ">"))}:
             confidence, kind = rank_contact(email, domain)
             if not confidence:
                 continue
-            record = {"email": email, "domain": domain, "source_url": source_url, "kind": kind, "confidence": confidence, "verified_mx": verify_mx(email)}
+            record = {
+                "email": email, "domain": domain, "source_url": source_url,
+                "kind": kind, "confidence": confidence, "verified_mx": verify_mx(email),
+            }
             previous = results.get(email)
-            if not previous or record["confidence"] > previous["confidence"]:
+            if not previous or (record["confidence"], record["verified_mx"]) > (previous["confidence"], previous["verified_mx"]):
                 results[email] = record
+
+    # Some job boards copy a public recruiting mailbox into the listing. It is
+    # already job-specific evidence, so accept only public role/generic aliases
+    # with a real MX domain; never a person's mailbox.
+    if job_description and apply_url:
+        for email in {match.casefold() for match in EMAIL_RE.findall(job_description.replace("\\u003e", ">"))}:
+            email_domain = email.rsplit("@", 1)[1]
+            add_contacts(email, email_domain, apply_url)
+    if results:
+        return sorted(results.values(), key=lambda item: (item["confidence"], item["verified_mx"]), reverse=True)
+
+    domain, site = company_domain(company_website, apply_url, company_name)
+    if not domain or not site:
+        return sorted(results.values(), key=lambda item: (item["confidence"], item["verified_mx"]), reverse=True)
+    parsed = urlparse(site)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    candidates = [root, *[urljoin(root + "/", path) for path in ("contact", "careers", "jobs", "about", "team", "join-us", "work-with-us", "contact-us")]]
+    def scan_pages(pages: list[str]) -> None:
+        for page in pages:
+            if not _robots_allows(page):
+                continue
+            try:
+                source_url, text = _website_text(page)
+            except (ValueError, httpx.HTTPError):
+                continue
+            add_contacts(text, domain, source_url)
+
+    scan_pages(list(dict.fromkeys(candidates)))
+    if not results:
+        # Search-result pages are a fallback only after the official domain has
+        # been established, and only when they stay on that same public domain.
+        fallback_pages = []
+        for page in _search_company_pages(company_name):
+            host = (urlparse(page).hostname or "").casefold().removeprefix("www.")
+            if (host == domain or host.endswith("." + domain)) and page not in candidates:
+                fallback_pages.append(page)
+        scan_pages(fallback_pages)
     return sorted(results.values(), key=lambda item: (item["confidence"], item["verified_mx"]), reverse=True)

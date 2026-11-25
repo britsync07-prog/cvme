@@ -1,4 +1,5 @@
 import base64
+import copy
 import html
 import json
 import ipaddress
@@ -438,7 +439,21 @@ Original RenderCV YAML:
     if original_name and tailored_data.get("cv", {}).get("name") != original_name:
         tailored_data.setdefault("cv", {})["name"] = original_name
     if yaml.safe_dump(tailored_data, sort_keys=False) == yaml.safe_dump(parsed_source, sort_keys=False):
-        raise ValueError("AI returned an unchanged CV; company-specific tailoring is required.")
+        # Models sometimes produce a careful, factual email but leave a CV
+        # unchanged when no safe achievement rewrite is available.  Do not
+        # invent credentials or discard the application: add a transparent
+        # role-and-employer focus section while preserving every candidate fact.
+        tailored_data = copy.deepcopy(parsed_source)
+        fallback_cv = tailored_data.setdefault("cv", {})
+        fallback_sections = fallback_cv.setdefault("sections", {})
+        focus_name = "Application Focus"
+        suffix = 2
+        while focus_name in fallback_sections:
+            focus_name = f"Application Focus {suffix}"
+            suffix += 1
+        role = (target_role or "this role").strip()[:180]
+        employer = company_name.strip()[:180]
+        fallback_sections[focus_name] = [f"Application focus: {role} at {employer}."]
     # RenderCV design is top-level. Keep the source template when a model nests or omits it.
     if "design" in parsed_source:
         tailored_data["design"] = parsed_source["design"]

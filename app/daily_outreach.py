@@ -3,6 +3,7 @@
 import asyncio
 import json
 import random
+import re
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -52,6 +53,10 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
         errors.append("OUTREACH_QUERY or OUTREACH_TARGET_ROLE is required for job search.")
     if not 1 <= configured_limit <= 100:
         errors.append("Daily outreach limit must be between 1 and 100.")
+    if not 1 <= settings.outreach_max_search_pages <= 25:
+        errors.append("OUTREACH_MAX_SEARCH_PAGES must be between 1 and 25.")
+    if not 25 <= settings.outreach_search_page_size <= 100:
+        errors.append("OUTREACH_SEARCH_PAGE_SIZE must be between 25 and 100.")
     if not settings.api_key or not settings.base_url or not settings.llm_model:
         errors.append("BASE_URL, API_KEY, and LLM_MODEL are required.")
     if workspace_auto_send:
@@ -88,6 +93,16 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
     return errors
 
 
+def _search_variants(keywords: str) -> list[str]:
+    """Treat configured semicolon/newline role phrases as alternatives, not one giant query."""
+    variants: list[str] = []
+    for value in re.split(r"[;|\n]+", keywords):
+        value = value.strip()
+        if value and value.casefold() not in {item.casefold() for item in variants}:
+            variants.append(value)
+    return variants or [keywords.strip()]
+
+
 def discover_job_batch(
     *,
     workspace_id: int | None,
@@ -97,79 +112,102 @@ def discover_job_batch(
     limit: int,
     send_when_ready: bool,
 ) -> dict[str, int]:
-    """Find real job listings, prepare one campaign per new listing, and optionally send it."""
+    """Search pages and role variants until the daily send target is met or sources are exhausted."""
     limit = min(max(limit, 1), 100)
-    job_query = JobQuery(keywords=keywords, page_size=limit)
-    results, statuses = asyncio.run(aggregate_search(job_query))
+    totals = {"discovered": 0, "completed": 0, "sent": 0}
+    processed_job_ids: set[int] = set()
 
-    with SessionLocal() as db:
-        workspace = db.get(Workspace, workspace_id) if workspace_id else ensure_default_workspace(db)[0]
-        owner = db.get(User, workspace.owner_user_id) if workspace.owner_user_id else None
-        if not owner:
-            raise RuntimeError("Workspace owner was not found.")
-        persisted_jobs = _persist_jobs(db, workspace, owner, job_query, results, statuses)
-        # A commit expires ORM objects by default. Keep the small, immutable
-        # application snapshot needed below so this batch never dereferences a
-        # detached Job after the database session closes.
-        jobs = [
-            {
-                "id": job.id,
-                "company_name": job.company_name,
-                "company_website": job.company_website,
-                "apply_url": job.apply_url,
-                "title": job.title,
-                "description": job.description,
-            }
-            for job in persisted_jobs
-        ]
-        db.commit()
-
-    totals = {"discovered": len(jobs), "completed": 0, "sent": 0}
-    for job in jobs:
-        if totals["sent"] >= limit:
-            break
+    def persist_page(job_query: JobQuery, results, statuses) -> list[dict]:
         with SessionLocal() as db:
-            existing = db.scalar(
-                select(Campaign.id).where(
-                    Campaign.workspace_id == (workspace_id or ensure_default_workspace(db)[0].id),
-                    Campaign.job_id == job["id"],
-                    Campaign.deleted_at.is_(None),
+            workspace = db.get(Workspace, workspace_id) if workspace_id else ensure_default_workspace(db)[0]
+            owner = db.get(User, workspace.owner_user_id) if workspace.owner_user_id else None
+            if not owner:
+                raise RuntimeError("Workspace owner was not found.")
+            persisted_jobs = _persist_jobs(db, workspace, owner, job_query, results, statuses)
+            # A commit expires ORM objects by default. Keep the immutable fields
+            # needed for research after the database session closes.
+            jobs = [
+                {
+                    "id": job.id,
+                    "company_name": job.company_name,
+                    "company_website": job.company_website,
+                    "apply_url": job.apply_url,
+                    "title": job.title,
+                    "description": job.description,
+                }
+                for job in persisted_jobs
+            ]
+            db.commit()
+        return jobs
+
+    def process_jobs(jobs: list[dict]) -> None:
+        for job in jobs:
+            if totals["sent"] >= limit:
+                return
+            with SessionLocal() as db:
+                existing = db.scalar(
+                    select(Campaign.id).where(
+                        Campaign.workspace_id == (workspace_id or ensure_default_workspace(db)[0].id),
+                        Campaign.job_id == job["id"],
+                        Campaign.deleted_at.is_(None),
+                    )
                 )
-            )
-        if existing:
-            continue
+            if existing:
+                continue
 
-        try:
-            contacts = find_public_company_contacts(
-                job["company_name"], job["company_website"], job["apply_url"], job["description"],
-            )
-        except (ValueError, OSError):
-            continue
-        contact = next((item for item in contacts if item.get("verified_mx")), None)
-        if not contact:
-            continue
+            try:
+                contacts = find_public_company_contacts(
+                    job["company_name"], job["company_website"], job["apply_url"], job["description"],
+                )
+            except (ValueError, OSError):
+                continue
+            contact = next((item for item in contacts if item.get("verified_mx")), None)
+            if not contact:
+                continue
 
-        try:
-            response = create_campaign(
-                workspace_id=workspace_id,
-                job_id=job["id"],
-                candidate_id=candidate_id,
-                company_name=job["company_name"],
-                company_url=job["company_website"] or job["apply_url"],
-                target_role=target_role or job["title"],
-                job_description=(job["description"] or f"Job listing: {job['apply_url']}") + f"\n\nPublic employer contact source: {contact['source_url']}\nVerified recipient: {contact['email']}",
-                recipient_email=contact["email"],
-                auto_prepare=True,
-            )
-            campaign_id = int(response.headers["location"].rsplit("/", 1)[-1])
-            totals["completed"] += 1
-            if send_when_ready:
-                send_campaign(campaign_id, approved=True, workspace_id=workspace_id)
-                totals["sent"] += 1
-                if settings.environment == "production":
-                    time.sleep(random.uniform(max(settings.outreach_min_delay_seconds, 0), max(settings.outreach_max_delay_seconds, settings.outreach_min_delay_seconds)))
-        except HTTPException:
-            continue
+            try:
+                response = create_campaign(
+                    workspace_id=workspace_id,
+                    job_id=job["id"],
+                    candidate_id=candidate_id,
+                    company_name=job["company_name"],
+                    company_url=job["company_website"] or job["apply_url"],
+                    target_role=target_role or job["title"],
+                    job_description=(job["description"] or f"Job listing: {job['apply_url']}") + f"\n\nPublic employer contact source: {contact['source_url']}\nVerified recipient: {contact['email']}",
+                    recipient_email=contact["email"],
+                    auto_prepare=True,
+                )
+                campaign_id = int(response.headers["location"].rsplit("/", 1)[-1])
+                totals["completed"] += 1
+                if send_when_ready:
+                    send_campaign(campaign_id, approved=True, workspace_id=workspace_id)
+                    totals["sent"] += 1
+                    if settings.environment == "production":
+                        time.sleep(random.uniform(max(settings.outreach_min_delay_seconds, 0), max(settings.outreach_max_delay_seconds, settings.outreach_min_delay_seconds)))
+            except HTTPException:
+                continue
+
+    for search_term in _search_variants(keywords):
+        for page in range(1, settings.outreach_max_search_pages + 1):
+            if totals["sent"] >= limit:
+                return totals
+            job_query = JobQuery(keywords=search_term, page=page, page_size=settings.outreach_search_page_size)
+            results, statuses = asyncio.run(aggregate_search(job_query))
+            if not results:
+                break
+            jobs = persist_page(job_query, results, statuses)
+            new_jobs = [job for job in jobs if job["id"] not in processed_job_ids]
+            processed_job_ids.update(job["id"] for job in jobs)
+            if not new_jobs:
+                # Providers without pagination return the same first page; do
+                # not burn the whole daily worker on repeated results. Still
+                # try page two: page one may contain jobs saved by a prior run
+                # while a paginated provider has fresh results behind it.
+                if page > 1:
+                    break
+                continue
+            totals["discovered"] += len(new_jobs)
+            process_jobs(new_jobs)
     return totals
 
 

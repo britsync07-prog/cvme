@@ -403,6 +403,43 @@ def test_scheduled_job_batch_prepares_and_sends_a_verified_employer_contact(monk
     assert result == {"discovered": 1, "completed": 1, "sent": 1}
 
 
+def test_scheduled_job_batch_searches_additional_pages_until_daily_target(monkeypatch):
+    candidate_id = _outreach_ready_candidate_id()
+    with SessionLocal() as db:
+        workspace, _ = ensure_default_workspace(db)
+        candidate = db.get(Candidate, candidate_id)
+        candidate.workspace_id = workspace.id
+        db.commit()
+        workspace_id = workspace.id
+
+    def job(job_id):
+        return SimpleNamespace(
+            id=job_id, company_name=f"Acme {job_id}", company_website="https://acme.example",
+            apply_url=f"https://acme.example/jobs/{job_id}", title="Backend Engineer", description="Build APIs.",
+        )
+
+    calls, sent = [], []
+
+    async def aggregate(query):
+        calls.append((query.keywords, query.page, query.page_size))
+        return ({1: [job(101)], 2: [job(102)]}.get(query.page, []), [])
+
+    monkeypatch.setattr(daily_outreach, "aggregate_search", aggregate)
+    monkeypatch.setattr(daily_outreach, "_persist_jobs", lambda _db, _workspace, _owner, _query, results, _statuses: results)
+    monkeypatch.setattr(daily_outreach, "find_public_company_contacts", lambda *args: [{"email": "careers@acme.example", "source_url": "https://acme.example/careers", "verified_mx": True}])
+    monkeypatch.setattr(daily_outreach, "create_campaign", lambda **kwargs: RedirectResponse(f"/campaigns/{kwargs['job_id']}", status_code=303))
+    monkeypatch.setattr(daily_outreach, "send_campaign", lambda campaign_id, **kwargs: sent.append((campaign_id, kwargs)))
+
+    result = daily_outreach.discover_job_batch(
+        workspace_id=workspace_id, candidate_id=candidate_id, keywords="backend; platform",
+        target_role="Backend Engineer", limit=2, send_when_ready=True,
+    )
+
+    assert calls == [("backend", 1, 100), ("backend", 2, 100)]
+    assert [campaign_id for campaign_id, _ in sent] == [101, 102]
+    assert result == {"discovered": 2, "completed": 2, "sent": 2}
+
+
 def test_search_web_uses_duckduckgo_lite_when_html_has_no_results(monkeypatch):
     class Response:
         def __init__(self, text):

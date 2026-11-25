@@ -107,7 +107,21 @@ def discover_job_batch(
         owner = db.get(User, workspace.owner_user_id) if workspace.owner_user_id else None
         if not owner:
             raise RuntimeError("Workspace owner was not found.")
-        jobs = _persist_jobs(db, workspace, owner, job_query, results, statuses)
+        persisted_jobs = _persist_jobs(db, workspace, owner, job_query, results, statuses)
+        # A commit expires ORM objects by default. Keep the small, immutable
+        # application snapshot needed below so this batch never dereferences a
+        # detached Job after the database session closes.
+        jobs = [
+            {
+                "id": job.id,
+                "company_name": job.company_name,
+                "company_website": job.company_website,
+                "apply_url": job.apply_url,
+                "title": job.title,
+                "description": job.description,
+            }
+            for job in persisted_jobs
+        ]
         db.commit()
 
     totals = {"discovered": len(jobs), "completed": 0, "sent": 0}
@@ -118,7 +132,7 @@ def discover_job_batch(
             existing = db.scalar(
                 select(Campaign.id).where(
                     Campaign.workspace_id == (workspace_id or ensure_default_workspace(db)[0].id),
-                    Campaign.job_id == job.id,
+                    Campaign.job_id == job["id"],
                     Campaign.deleted_at.is_(None),
                 )
             )
@@ -126,7 +140,7 @@ def discover_job_batch(
             continue
 
         try:
-            contacts = find_public_company_contacts(job.company_name, job.company_website, job.apply_url)
+            contacts = find_public_company_contacts(job["company_name"], job["company_website"], job["apply_url"])
         except (ValueError, OSError):
             continue
         contact = next((item for item in contacts if item.get("verified_mx")), None)
@@ -136,12 +150,12 @@ def discover_job_batch(
         try:
             response = create_campaign(
                 workspace_id=workspace_id,
-                job_id=job.id,
+                job_id=job["id"],
                 candidate_id=candidate_id,
-                company_name=job.company_name,
-                company_url=job.company_website or job.apply_url,
-                target_role=target_role or job.title,
-                job_description=(job.description or f"Job listing: {job.apply_url}") + f"\n\nPublic employer contact source: {contact['source_url']}\nVerified recipient: {contact['email']}",
+                company_name=job["company_name"],
+                company_url=job["company_website"] or job["apply_url"],
+                target_role=target_role or job["title"],
+                job_description=(job["description"] or f"Job listing: {job['apply_url']}") + f"\n\nPublic employer contact source: {contact['source_url']}\nVerified recipient: {contact['email']}",
                 recipient_email=contact["email"],
                 auto_prepare=True,
             )

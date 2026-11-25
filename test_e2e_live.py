@@ -1,4 +1,4 @@
-"""End-to-End System Test for RenderCV TailorMail.
+"""End-to-End System Test for RenderCV TailorJobhunt.
 
 Simulates:
 1. Adding candidate information with RenderCV YAML.

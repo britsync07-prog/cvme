@@ -32,6 +32,7 @@ class Campaign(Base):
     workspace_id: Mapped[int | None] = mapped_column(ForeignKey("workspaces.id"), nullable=True, index=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"))
+    job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
     company_name: Mapped[str] = mapped_column(String(300))
     company_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     target_role: Mapped[str | None] = mapped_column(String(300), nullable=True)
@@ -49,6 +50,7 @@ class Campaign(Base):
     workspace: Mapped["Workspace | None"] = relationship(back_populates="campaigns")
     user: Mapped["User | None"] = relationship(back_populates="campaigns")
     candidate: Mapped[Candidate] = relationship(back_populates="campaigns")
+    job: Mapped["Job | None"] = relationship(back_populates="campaigns")
     events: Mapped[list["AuditEvent"]] = relationship(back_populates="campaign", cascade="all, delete-orphan")
 
 
@@ -304,6 +306,77 @@ class Suppression(Base):
     domain: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     reason: Mapped[str] = mapped_column(String(80), default="unsubscribe")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class Job(Base):
+    """A normalized listing retained inside one workspace after provider search."""
+    __tablename__ = "jobs"
+    __table_args__ = (UniqueConstraint("workspace_id", "external_id", name="uq_job_workspace_external"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    external_id: Mapped[str] = mapped_column(String(128), index=True)
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    source_job_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sources: Mapped[list] = mapped_column(JSON, default=list)
+    title: Mapped[str] = mapped_column(String(500))
+    company_name: Mapped[str] = mapped_column(String(300), index=True)
+    company_website: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    location_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    country_code: Mapped[str | None] = mapped_column(String(2), nullable=True, index=True)
+    city: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    is_remote: Mapped[bool] = mapped_column(Boolean, default=False)
+    job_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    salary_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    salary_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    salary_currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    apply_url: Mapped[str] = mapped_column(String(2000))
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    campaigns: Mapped[list[Campaign]] = relationship(back_populates="job")
+
+
+class JobSearch(Base):
+    __tablename__ = "job_searches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    query: Mapped[dict] = mapped_column(JSON, default=dict)
+    result_count: Mapped[int] = mapped_column(Integer, default=0)
+    provider_statuses: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+
+class SavedJob(Base):
+    __tablename__ = "saved_jobs"
+    __table_args__ = (UniqueConstraint("workspace_id", "job_id", name="uq_saved_job_workspace_job"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CompanyContact(Base):
+    __tablename__ = "company_contacts"
+    __table_args__ = (UniqueConstraint("workspace_id", "job_id", "email", name="uq_company_contact_job_email"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id"), index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"), index=True)
+    company_name: Mapped[str] = mapped_column(String(300))
+    domain: Mapped[str] = mapped_column(String(255), index=True)
+    email: Mapped[str] = mapped_column(String(320), index=True)
+    source_url: Mapped[str] = mapped_column(String(2000))
+    kind: Mapped[str] = mapped_column(String(20), default="generic")
+    confidence: Mapped[int] = mapped_column(Integer, default=0)
+    found_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    verified_mx: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class SystemSetting(Base):

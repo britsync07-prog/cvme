@@ -1,5 +1,5 @@
 [Unit]
-Description=TailorMail daily outreach batch
+Description=TailorJobhunt daily outreach batch
 After=docker.service
 Requires=docker.service
 

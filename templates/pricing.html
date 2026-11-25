@@ -2,15 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="description" content="TailorMail plans for company-specific CVs and outreach">
-  <title>Pricing - TailorMail</title><link rel="stylesheet" href="/static/app.css">
+  <meta name="description" content="TailorJobhunt plans for company-specific CVs and outreach">
+  <title>Pricing - TailorJobhunt</title><link rel="stylesheet" href="/static/app.css">
 </head>
 <body><main class="public-shell">
-  <nav class="public-nav" aria-label="Public navigation"><a class="brand" href="/landing"><span class="logo-mark">TM</span><span class="app-title">TailorMail</span></a><div class="public-links"><a href="/landing">Home</a><a href="/contact">Contact</a><a class="button-link" href="/signup">Start free trial</a></div></nav>
+  <nav class="public-nav" aria-label="Public navigation"><a class="brand" href="/landing"><span class="logo-mark">TJ</span><span class="app-title">TailorJobhunt</span></a><div class="public-links"><a href="/landing">Home</a><a href="/contact">Contact</a><a class="button-link" href="/signup">Start free trial</a></div></nav>
   <section class="public-hero"><p>Plans for deliberate outreach</p><h1>Choose your sending pace.</h1><p>Every plan starts with a 15-day trial. Bring your own AI key and sender, then keep every application in one workspace.</p><div class="pricing-toggle" role="group" aria-label="Billing interval"><button class="button primary" type="button" id="monthly" onclick="setIntervalMode('monthly')">Monthly</button><button class="button ghost" type="button" id="yearly" onclick="setIntervalMode('yearly')">Yearly</button></div></section>
   <section class="pricing-grid" aria-label="Plans">
     {% for plan in plans %}<article class="pricing-card{% if plan.slug == 'pro' %} pricing-featured{% endif %}"><p>{{ plan.name }}</p><h2><span data-monthly="{{ '%.2f'|format(plan.monthly_price_cents / 100) }}" data-yearly="{{ '%.2f'|format(plan.yearly_price_cents / 100) }}">{{ '%.2f'|format(plan.monthly_price_cents / 100) }}</span> <small>GBP / month</small></h2><p>{{ plan.limits.get('daily_emails', 0) }} emails per day</p><p>{{ plan.limits.get('cv_profiles', 1) }} CV profile(s), workspace audit trail, and tailored output.</p><a class="button primary" href="/signup">Start trial</a></article>{% endfor %}
   </section>
   <p class="pricing-note">Need a team plan or have a billing question? <a href="/contact">Contact support</a>.</p>
-  <footer class="public-footer"><span>TailorMail by Ascentra Consulting</span><span><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/acceptable-use">Acceptable use</a><a href="/refunds">Refunds</a><a href="/cookies">Cookies</a></span></footer>
-</main><script>function setIntervalMode(mode){document.querySelectorAll('[data-monthly]').forEach(function(el){el.textContent=mode==='yearly'?el.dataset.yearly:el.dataset.monthly});document.querySelectorAll('[data-monthly]').forEach(function(el){el.nextElementSibling.textContent='GBP / '+(mode==='yearly'?'year':'month')});document.getElementById('monthly').classList.toggle('primary',mode==='monthly');document.getElementById('yearly').classList.toggle('primary',mode==='yearly')}</script></body></html>
+  <footer class="public-footer"><span>TailorJobhunt by Ascentra Consulting</span><span><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/acceptable-use">Acceptable use</a><a href="/refunds">Refunds</a><a href="/cookies">Cookies</a></span></footer>
+</main><script nonce="{{ csp_nonce(request) }}">function setIntervalMode(mode){document.querySelectorAll('[data-monthly]').forEach(function(el){el.textContent=mode==='yearly'?el.dataset.yearly:el.dataset.monthly});document.querySelectorAll('[data-monthly]').forEach(function(el){el.nextElementSibling.textContent='GBP / '+(mode==='yearly'?'year':'month')});document.getElementById('monthly').classList.toggle('primary',mode==='monthly');document.getElementById('yearly').classList.toggle('primary',mode==='yearly')}</script></body></html>

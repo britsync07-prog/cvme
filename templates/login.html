@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign in · TailorMail</title>
+  <title>Sign in · TailorJobhunt</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="login-page">
   <main class="login-card" aria-labelledby="login-title">
-    <div class="logo-mark" aria-hidden="true">TM</div>
-    <p class="eyebrow">TailorMail</p>
+    <div class="logo-mark" aria-hidden="true">TJ</div>
+    <p class="eyebrow">TailorJobhunt</p>
     <h1 id="login-title">Sign in to your outreach dashboard</h1>
     <p class="login-copy">Use your dashboard credentials to continue.</p>
     {% if error %}<p class="login-error" role="alert">{{ error }}</p>{% endif %}
@@ -23,7 +23,7 @@
     </form>
     <a class="button secondary" href="/auth/google">Continue with Google</a>
     <p class="login-copy"><a href="/forgot-password">Forgot password?</a></p>
-    <p class="login-copy">New to TailorMail? <a href="/signup">Create a workspace</a></p>
+    <p class="login-copy">New to TailorJobhunt? <a href="/signup">Create a workspace</a></p>
   </main>
 </body>
 </html>

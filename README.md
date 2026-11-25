@@ -1,4 +1,4 @@
-# TailorMail: RenderCV Tailoring & Automated Outreach Studio
+# TailorJobhunt: RenderCV Tailoring & Automated Outreach Studio
 
 A production-ready platform that combines [RenderCV](https://github.com/rendercv/rendercv.git) with targeted company research and tailored email outreach.
 
@@ -56,7 +56,7 @@ pip install "rendercv[full]"
 ### 2. Configure Environment (`.env`)
 Copy `.env.example` to `.env` or configure via the Dashboard:
 ```ini
-DATABASE_URL=sqlite:///./data/tailormail.db
+DATABASE_URL=sqlite:///./data/tailorjobhunt.db
 APP_SECRET=your-random-secret
 ENVIRONMENT=development
 ALLOWED_HOSTS=localhost,127.0.0.1
@@ -115,3 +115,25 @@ python -m pytest -v
 python test_e2e_live.py
 ```
 This script executes the complete lifecycle: candidate registration, target application creation, research, truthful tailoring, RenderCV PDF compilation (verifying PDF magic bytes & size), email review/editing, and approved SMTP dispatch with duplicate-send protection.
+
+---
+
+## Job Search & Outreach
+
+The **Jobs** dashboard tab searches enabled, published job APIs and stores normalized results inside the active workspace. A job’s **Apply** button always opens the provider’s canonical application/listing URL. **Find company email** searches only public company pages that permit the fetch, then stores public role/generic mailboxes with the source URL and DNS-MX result. It never guesses personal addresses, probes SMTP, bypasses a login wall, or scrapes social networks.
+
+**Tailor & Email** does not send immediately. It creates a normal campaign from the job title and description, queues the existing research → truthful LLM tailoring → RenderCV PDF flow, and opens the existing review page. Sending still requires explicit approval and is subject to the workspace send budget, suppression list, duplicate-send lock, and `CONTACT_COOLDOWN_DAYS` (30 by default).
+
+| Provider | Configuration | Integration and operational limit |
+| --- | --- | --- |
+| Himalayas | Keyless (`ENABLE_HIMALAYAS=true`) | Public search API; country ISO alpha-2, canonical `applicationLink`; optional free key increases the published allowance to 60 req/min and 10,000/day. |
+| Remotive | Keyless | Public remote-jobs API; cache is required and the provider advises no more than 2 requests/minute / about 4 refreshes/day. |
+| Arbeitnow | Keyless | Public paginated board API; filters are applied client-side where the API has no corresponding parameter. |
+| Jobicy | Keyless | Public remote API returns a canonical Jobicy listing; direct ATS links require its commercial key. Keep source attribution and do not poll more than hourly. |
+| The Muse | Keyless; `THE_MUSE_API_KEY` optional | Public jobs API. |
+| Adzuna | `ADZUNA_APP_ID`, `ADZUNA_APP_KEY` | Official country-index search API; useful for on-site and non-IT roles. |
+| Jooble | `JOOBLE_API_KEY` | Official `POST /api/{key}` search. Free plan and country-key conditions are controlled by Jooble; their current help page states 100 requests/day per country key. |
+| JobSpy | `ENABLE_JOBSPY=true`, optional `JOBSPY_PROXIES` | Optional package adapter for supported boards; runs in a bounded worker thread and non-fatal 429/timeouts are shown in provider status. Respect every source’s terms. |
+| `jamiemaguiredotnet/RemoteJobs` | Disabled reference adapter | The repository is a .NET aggregator that writes a local JSON file, not a hosted public feed. It is documented as a source-pattern reference and is never scraped. |
+
+Set the corresponding keys and toggles in `.env`; leave unavailable providers blank. `JOB_CACHE_TTL_SECONDS` defaults to 900, `JOB_PROVIDER_TIMEOUT_SECONDS` to 30, and `CONTACT_COOLDOWN_DAYS` to 30. Provider status chips disclose skipped, cached, failed, and successful partial searches so one source cannot hide results from the others.

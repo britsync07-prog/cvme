@@ -26,6 +26,25 @@ class Settings(BaseSettings):
     resend_from: str = ""
     resend_webhook_secret: str = ""
     companies_house_api_key: str = ""
+    adzuna_app_id: str = ""
+    adzuna_app_key: str = ""
+    jooble_api_key: str = ""
+    the_muse_api_key: str = ""
+    jobspy_proxies: str = ""
+    enable_jobspy: bool = True
+    enable_himalayas: bool = True
+    enable_adzuna: bool = True
+    enable_jooble: bool = True
+    enable_remotive: bool = True
+    enable_arbeitnow: bool = True
+    enable_jobicy: bool = True
+    # The former public endpoint now returns 404; leave off until a valid
+    # registered API integration is configured.
+    enable_the_muse: bool = False
+    enable_remotejobs_reference: bool = False
+    job_cache_ttl_seconds: int = 900
+    job_provider_timeout_seconds: int = 30
+    contact_cooldown_days: int = 30
     scrapollo_binary: str = "scrapollo"
     scrapollo_cookie_file: str = ""
     scrapollo_input_file: str = ""

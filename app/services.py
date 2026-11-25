@@ -94,7 +94,7 @@ def _website_text(website: str) -> tuple[str, str]:
     for _ in range(4):
         response = httpx.get(
             current, timeout=15, follow_redirects=False,
-            headers={"User-Agent": "TailorMail research bot/1.0"},
+            headers={"User-Agent": "TailorJobhunt research bot/1.0"},
         )
         if response.status_code not in {301, 302, 303, 307, 308}:
             break
@@ -117,7 +117,7 @@ def _search_web(query: str) -> list[str]:
         try:
             response = httpx.get(
                 search_url, params={"q": query}, timeout=20,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; TailorMail/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (compatible; TailorJobhunt/1.0)"},
             )
             response.raise_for_status()
         except httpx.HTTPError:
@@ -656,7 +656,7 @@ def send_system_email(recipient: str, subject: str, body: str) -> None:
                 "to": [recipient],
                 "subject": subject,
                 "text": body,
-                "html": f"<main style='font-family:Arial,sans-serif;line-height:1.5'><h2>TailorMail</h2><p>{html.escape(body).replace(chr(10), '<br>')}</p></main>",
+                "html": f"<main style='font-family:Arial,sans-serif;line-height:1.5'><h2>TailorJobhunt</h2><p>{html.escape(body).replace(chr(10), '<br>')}</p></main>",
             },
             timeout=30,
         )
@@ -669,7 +669,7 @@ def send_system_email(recipient: str, subject: str, body: str) -> None:
     message["To"] = recipient
     message["Subject"] = subject
     message.set_content(body)
-    message.add_alternative(f"<main style='font-family:Arial,sans-serif;line-height:1.5'><h2>TailorMail</h2><p>{html.escape(body).replace(chr(10), '<br>')}</p></main>", subtype="html")
+    message.add_alternative(f"<main style='font-family:Arial,sans-serif;line-height:1.5'><h2>TailorJobhunt</h2><p>{html.escape(body).replace(chr(10), '<br>')}</p></main>", subtype="html")
     with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as client:
         if settings.smtp_use_tls:
             client.starttls()

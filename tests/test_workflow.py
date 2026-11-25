@@ -91,6 +91,15 @@ def test_healthz_is_available_with_dashboard_auth_configured(monkeypatch):
     assert response.status_code == 200
 
 
+def test_resend_webhook_requires_a_verification_secret(monkeypatch):
+    monkeypatch.setattr(main.settings, "resend_webhook_secret", "")
+
+    with TestClient(app, base_url="http://localhost") as client:
+        response = client.post("/webhooks/resend", content=b"{}")
+
+    assert response.status_code == 503
+
+
 def test_login_form_protects_dashboard_with_a_session(monkeypatch):
     monkeypatch.setattr(main.settings, "admin_username", "admin")
     monkeypatch.setattr(main.settings, "admin_password", "Saimon55@")
@@ -336,7 +345,7 @@ def _configure_daily_worker(monkeypatch, candidate_id: int) -> None:
     monkeypatch.setattr(daily_outreach.settings, "outreach_timezone", "UTC")
 
 
-def test_daily_worker_fails_when_auto_send_misses_target(monkeypatch):
+def test_daily_worker_returns_cleanly_when_auto_send_has_no_verified_leads(monkeypatch):
     _configure_daily_worker(monkeypatch, _outreach_ready_candidate_id())
     monkeypatch.setattr(
         daily_outreach,
@@ -345,8 +354,7 @@ def test_daily_worker_fails_when_auto_send_misses_target(monkeypatch):
     )
     monkeypatch.setattr(daily_outreach, "remaining_daily_send_budget", lambda db: 99)
 
-    with pytest.raises(SystemExit, match="99 slots remain"):
-        daily_outreach.main()
+    daily_outreach.main()
 
 
 def test_daily_worker_stops_for_missing_candidate(monkeypatch):

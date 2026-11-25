@@ -1,4 +1,4 @@
-# TailorMail phase audit
+# TailorJobhunt phase audit
 
 | Phase | Current evidence |
 | --- | --- |

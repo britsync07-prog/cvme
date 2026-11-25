@@ -128,10 +128,8 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
             print(json.dumps(totals))
             if result["completed"] < remaining:
                 if job_id:
-                    mark_job(job_id, "failed", progress=100, error="Daily preparation target missed.")
-                raise SystemExit(
-                    f"Daily preparation target missed: prepared {result['completed']} of {remaining}."
-                )
+                    mark_job(job_id, "partial", progress=100, error="Daily preparation target was not met.")
+                return
             if job_id:
                 mark_job(job_id, "succeeded", progress=100)
             return
@@ -139,8 +137,8 @@ def main(workspace_id: int | None = None, job_id: int | None = None) -> None:
             print(json.dumps(totals))
             action = "send" if auto_send else "preparation"
             if job_id:
-                mark_job(job_id, "failed", progress=100, error=f"Daily {action} target missed.")
-            raise SystemExit(f"Daily {action} target missed: {remaining} slots remain; no new verified leads were available.")
+                mark_job(job_id, "partial", progress=100, error=f"Daily {action} target was not met; no new verified leads were available.")
+            return
         if result["completed"] == 0:
             # A failed AI/render/send attempt must not prevent trying the next lead.
             continue

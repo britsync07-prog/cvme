@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import base64
@@ -30,7 +31,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_feature, require_send_slot, status_for
-from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, Coupon, EmailAccount, EmailVerificationToken, Invoice, Notification, OutreachJob, PasswordResetToken, Payment, Plan, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
+from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, CompanyContact, Coupon, EmailAccount, EmailVerificationToken, Invoice, Job, JobSearch, Notification, OutreachJob, PasswordResetToken, Payment, Plan, SavedJob, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
+from .jobs import JobQuery, aggregate_search, find_public_company_contacts, providers
 from .ops import enqueue_job, kill_switch_enabled, mark_job, set_setting, setting_value
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
@@ -73,7 +75,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="TailorMail", lifespan=lifespan)
+app = FastAPI(title="TailorJobhunt", lifespan=lifespan)
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=[host.strip() for host in settings.allowed_hosts.split(",") if host.strip()],
@@ -93,6 +95,14 @@ def csrf_token(request: Request) -> str:
 templates.env.globals["csrf_token"] = csrf_token
 
 
+def csp_nonce(request: Request) -> str:
+    """Return the per-response CSP nonce for the few legacy inline UI scripts."""
+    return getattr(request.state, "csp_nonce", "")
+
+
+templates.env.globals["csp_nonce"] = csp_nonce
+
+
 def rate_limited(request: Request, bucket: str, limit: int, window: int = 900) -> bool:
     """Best-effort distributed limiter; availability of Redis must not take down auth."""
     try:
@@ -109,9 +119,12 @@ def rate_limited(request: Request, bucket: str, limit: int, window: int = 900) -
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        public_paths = {"/", "/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/cookies", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
+        # Dashboard controls are deliberately inline in the existing template.
+        # A nonce retains a strict CSP while allowing those scripts to run.
+        request.state.csp_nonce = secrets.token_urlsafe(18)
+        public_paths = {"/healthz", "/login", "/signup", "/forgot-password", "/reset-password", "/verify-email", "/auth/google", "/auth/google/callback", "/landing", "/pricing", "/terms", "/privacy", "/acceptable-use", "/refunds", "/contact", "/cookies", "/sitemap.xml", "/robots.txt", "/unsubscribe", "/webhooks/resend"}
         if settings.maintenance_mode and request.url.path not in public_paths and not request.url.path.startswith("/static/") and not request.session.get("authenticated"):
-            return PlainTextResponse("TailorMail is temporarily under maintenance.", status_code=503)
+            return PlainTextResponse("TailorJobhunt is temporarily under maintenance.", status_code=503)
         if (
             settings.admin_username
             and request.url.path not in public_paths
@@ -133,7 +146,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' https://challenges.cloudflare.com; "
+            f"script-src 'self' 'nonce-{request.state.csp_nonce}' https://challenges.cloudflare.com; "
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com data:; "
             "img-src 'self' data:; "
@@ -258,7 +271,7 @@ def google_callback(request: Request, code: str = "", state: str = ""):
 
 @app.get("/landing")
 def landing_page(request: Request):
-    return templates.TemplateResponse(request, "landing.html", {})
+    return templates.TemplateResponse(request, "landing_brand.html", {})
 
 
 @app.get("/pricing")
@@ -276,15 +289,15 @@ def pricing_page(request: Request):
 
 def _legal_page(request: Request, page_name: str):
     pages = {
-        "terms": {"title": "Terms of service", "intro": "These terms govern your use of TailorMail, the workflow that helps you research companies and prepare company-specific applications.", "sections": [
+        "terms": {"title": "Terms of service", "intro": "These terms govern your use of TailorJobhunt, the workflow that helps you research companies and prepare company-specific applications.", "sections": [
             {"heading": "Your account", "paragraphs": ["You must provide accurate account information, protect your credentials, and keep your workspace access private. You are responsible for activity performed through your account."], "bullets": []},
-            {"heading": "Your content and AI output", "paragraphs": ["You retain ownership of CVs, leads, prompts, and other content you submit. You are responsible for checking every generated CV, email, claim, and recipient before sending. TailorMail does not guarantee that AI output is accurate, complete, or suitable for a particular role."], "bullets": []},
+            {"heading": "Your content and AI output", "paragraphs": ["You retain ownership of CVs, leads, prompts, and other content you submit. You are responsible for checking every generated CV, email, claim, and recipient before sending. TailorJobhunt does not guarantee that AI output is accurate, complete, or suitable for a particular role."], "bullets": []},
             {"heading": "Acceptable use", "paragraphs": ["You must comply with applicable marketing, privacy, employment, and anti-spam laws. Do not use the service for deception, harassment, unlawful profiling, bulk unsolicited messages, or content you do not have the right to use."], "bullets": []},
             {"heading": "Plans, trials, and suspension", "paragraphs": ["Trials and paid plans are described on the pricing page. We may pause sending or suspend an account to protect recipients, sender reputation, or the service, including when bounce or complaint rates are unsafe."], "bullets": []},
-            {"heading": "Service limits", "paragraphs": ["The service is provided on an availability basis. To the extent permitted by law, TailorMail is not liable for indirect loss, missed opportunities, or decisions made from generated output."], "bullets": []},
+            {"heading": "Service limits", "paragraphs": ["The service is provided on an availability basis. To the extent permitted by law, TailorJobhunt is not liable for indirect loss, missed opportunities, or decisions made from generated output."], "bullets": []},
             {"heading": "Contact", "paragraphs": ["Questions about these terms can be sent to support@ascentraconsulting.co.uk."], "bullets": []},
         ]},
-        "privacy": {"title": "Privacy policy", "intro": "This policy explains what TailorMail stores, why it is needed, and the controls available to each workspace.", "sections": [
+        "privacy": {"title": "Privacy policy", "intro": "This policy explains what TailorJobhunt stores, why it is needed, and the controls available to each workspace.", "sections": [
             {"heading": "Information we process", "paragraphs": ["We process account and workspace details, uploaded CV files, candidate facts, company and lead records, research notes, generated documents, delivery events, support requests, and security/audit events."], "bullets": []},
             {"heading": "Why we process it", "paragraphs": ["We use this information to provide the application workflow, tailor documents, send messages you approve, enforce limits, prevent abuse, provide support, and maintain reliable and secure infrastructure."], "bullets": []},
             {"heading": "Connected providers", "paragraphs": ["If you connect an AI provider, Gmail, SMTP, Companies House, payment, or delivery provider, the service exchanges only the data needed for the feature you enable. Provider credentials and tokens are encrypted at rest and masked in the interface."], "bullets": []},
@@ -292,9 +305,9 @@ def _legal_page(request: Request, page_name: str):
             {"heading": "Security", "paragraphs": ["Workspace records are scoped by workspace ID, sensitive credentials are encrypted, and administrative actions are audit logged. No internet service can promise absolute security; report suspected incidents promptly."], "bullets": []},
             {"heading": "Contact", "paragraphs": ["For privacy requests, email support@ascentraconsulting.co.uk."], "bullets": []},
         ]},
-        "acceptable-use": {"title": "Acceptable use policy", "intro": "TailorMail is for careful, relevant professional outreach. This policy protects recipients, users, and sender reputation.", "sections": [
+        "acceptable-use": {"title": "Acceptable use policy", "intro": "TailorJobhunt is for careful, relevant professional outreach. This policy protects recipients, users, and sender reputation.", "sections": [
             {"heading": "You may not", "paragraphs": [], "bullets": ["Send deceptive, abusive, threatening, discriminatory, or unlawful content.", "Harvest or target personal addresses when a lawful corporate address is not available.", "Ignore an opt-out, suppression request, bounce, or complaint.", "Misrepresent your identity, experience, employer, or relationship with a recipient.", "Circumvent daily limits, provider controls, or account suspension." ]},
-            {"heading": "Required sending practice", "paragraphs": ["Use a real sender identity, a relevant subject, truthful claims, and the opt-out mechanism provided by the service. Review AI output and recipient evidence before every send. TailorMail may skip unverified recipients or pause accounts with unsafe delivery signals."], "bullets": []},
+            {"heading": "Required sending practice", "paragraphs": ["Use a real sender identity, a relevant subject, truthful claims, and the opt-out mechanism provided by the service. Review AI output and recipient evidence before every send. TailorJobhunt may skip unverified recipients or pause accounts with unsafe delivery signals."], "bullets": []},
             {"heading": "Enforcement", "paragraphs": ["We may block a recipient or domain, pause a campaign, limit sending, or suspend an account while investigating abuse. We may preserve relevant audit records and cooperate with lawful requests."], "bullets": []},
         ]},
         "refunds": {"title": "Refund policy", "intro": "Our billing policy is designed to make trials and cancellation clear.", "sections": [
@@ -303,12 +316,12 @@ def _legal_page(request: Request, page_name: str):
             {"heading": "Refund requests", "paragraphs": ["If a duplicate charge, billing error, or exceptional circumstance occurs, contact support@ascentraconsulting.co.uk with the workspace and invoice details. Approved refunds are returned through the original payment method. Processing times depend on the payment provider."], "bullets": []},
             {"heading": "Failed payments", "paragraphs": ["We may retry a failed payment and temporarily restrict sending while the account is past due. You remain responsible for valid payment details during an active subscription."], "bullets": []},
         ]},
-        "contact": {"title": "Contact TailorMail", "intro": "We are here for account, privacy, billing, and delivery questions.", "sections": [
+        "contact": {"title": "Contact TailorJobhunt", "intro": "We are here for account, privacy, billing, and delivery questions.", "sections": [
             {"heading": "Support", "paragraphs": ["Email support@ascentraconsulting.co.uk with your workspace name, the affected campaign or message ID, and a short description. Never include an API key, password, or OAuth token in a support request."], "bullets": []},
             {"heading": "Responsible disclosure", "paragraphs": ["If you find a security issue, include reproduction steps and avoid accessing or changing other users' data. We will acknowledge reports as soon as practical."], "bullets": []},
-            {"heading": "Business details", "paragraphs": ["TailorMail is operated through Ascentra Consulting. See the Terms and Privacy pages for service and data-handling details."], "bullets": []},
+            {"heading": "Business details", "paragraphs": ["TailorJobhunt is operated through Ascentra Consulting. See the Terms and Privacy pages for service and data-handling details."], "bullets": []},
         ]},
-        "cookies": {"title": "Cookie notice", "intro": "TailorMail uses a small number of essential cookies to keep the application secure.", "sections": [
+        "cookies": {"title": "Cookie notice", "intro": "TailorJobhunt uses a small number of essential cookies to keep the application secure.", "sections": [
             {"heading": "Essential session state", "paragraphs": ["An HttpOnly, secure session cookie maintains sign-in state, CSRF protection, and OAuth handoffs. These cookies are required for authenticated features and are not used to build an advertising profile."], "bullets": []},
             {"heading": "No advertising cookies", "paragraphs": ["We do not use third-party advertising cookies or sell browsing information. Public pages may include ordinary server logs for security and reliability."], "bullets": []},
             {"heading": "Your choices", "paragraphs": ["You can clear cookies in your browser. Clearing essential cookies will sign you out and may prevent the application from working until they are enabled again."], "bullets": []},
@@ -411,7 +424,7 @@ def signup(
         db.add(EmailVerificationToken(user_id=user.id, token_hash=token_hash(verification), expires_at=utc_now() + timedelta(hours=24)))
         db.commit()
         try:
-            send_system_email(email, "Verify your TailorMail account", f"Verify your account: {settings.base_url}/verify-email?token={verification}")
+            send_system_email(email, "Verify your TailorJobhunt account", f"Verify your account: {settings.base_url}/verify-email?token={verification}")
         except Exception:
             pass
     return RedirectResponse("/", status_code=303)
@@ -427,7 +440,7 @@ def verify_email(request: Request, token: str = ""):
                 db.add(EmailVerificationToken(user_id=user.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=24)))
                 db.commit()
                 try:
-                    send_system_email(user.email, "Verify your TailorMail account", f"Verify your account: {settings.base_url}/verify-email?token={raw}")
+                    send_system_email(user.email, "Verify your TailorJobhunt account", f"Verify your account: {settings.base_url}/verify-email?token={raw}")
                 except Exception:
                     pass
                 return templates.TemplateResponse(request, "auth_message.html", {"title": "Check your email", "message": "We sent a verification link. The link expires in 24 hours."})
@@ -459,7 +472,7 @@ def forgot_password(request: Request, email: str = Form()):
             db.add(PasswordResetToken(user_id=user.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=1)))
             db.commit()
             try:
-                send_system_email(user.email, "Reset your TailorMail password", f"Reset your password: {settings.base_url}/reset-password?token={raw}")
+                    send_system_email(user.email, "Reset your TailorJobhunt password", f"Reset your password: {settings.base_url}/reset-password?token={raw}")
             except Exception:
                 pass
     return templates.TemplateResponse(request, "forgot_password.html", {"message": "If that email exists, a reset link has been sent."})
@@ -582,7 +595,7 @@ def change_email(request: Request, email: str = Form()):
         db.add(EmailVerificationToken(user_id=user.id, token_hash=token_hash(raw), expires_at=utc_now() + timedelta(hours=24)))
         db.commit()
         try:
-            send_system_email(normalized, "Verify your new TailorMail email", f"Verify your new address: {settings.base_url}/verify-email?token={raw}")
+            send_system_email(normalized, "Verify your new TailorJobhunt email", f"Verify your new address: {settings.base_url}/verify-email?token={raw}")
         except Exception:
             pass
     return RedirectResponse("/verify-email", status_code=303)
@@ -658,25 +671,26 @@ async def billing_webhook(request: Request):
 async def resend_webhook(request: Request):
     """Handle Resend bounce/complaint events and immediately suppress recipients."""
     body = await request.body()
-    if settings.resend_webhook_secret:
-        supplied = request.headers.get("x-tailormail-signature", "")
-        expected = hmac.new(settings.resend_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
-        valid = bool(supplied and hmac.compare_digest(supplied, expected))
-        svix_id = request.headers.get("svix-id", "")
-        svix_timestamp = request.headers.get("svix-timestamp", "")
-        svix_signature = request.headers.get("svix-signature", "")
-        try:
-            timestamp = int(svix_timestamp)
-            age = abs(datetime.now(timezone.utc).timestamp() - timestamp)
-            secret = settings.resend_webhook_secret.removeprefix("whsec_")
-            decoded_secret = base64.b64decode(secret + "=" * (-len(secret) % 4))
-            signed = f"{svix_id}.{svix_timestamp}.".encode() + body
-            svix_expected = base64.b64encode(hmac.new(decoded_secret, signed, hashlib.sha256).digest()).decode()
-            valid = valid or (age <= 300 and any(hmac.compare_digest(item.removeprefix("v1,"), svix_expected) for item in svix_signature.split()))
-        except (ValueError, binascii.Error):
-            pass
-        if not valid:
-            raise HTTPException(401, "Invalid webhook signature.")
+    if not settings.resend_webhook_secret:
+        raise HTTPException(503, "Resend webhook verification is not configured.")
+    supplied = request.headers.get("x-tailormail-signature", "")
+    expected = hmac.new(settings.resend_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+    valid = bool(supplied and hmac.compare_digest(supplied, expected))
+    svix_id = request.headers.get("svix-id", "")
+    svix_timestamp = request.headers.get("svix-timestamp", "")
+    svix_signature = request.headers.get("svix-signature", "")
+    try:
+        timestamp = int(svix_timestamp)
+        age = abs(datetime.now(timezone.utc).timestamp() - timestamp)
+        secret = settings.resend_webhook_secret.removeprefix("whsec_")
+        decoded_secret = base64.b64decode(secret + "=" * (-len(secret) % 4))
+        signed = f"{svix_id}.{svix_timestamp}.".encode() + body
+        svix_expected = base64.b64encode(hmac.new(decoded_secret, signed, hashlib.sha256).digest()).decode()
+        valid = valid or (age <= 300 and any(hmac.compare_digest(item.removeprefix("v1,"), svix_expected) for item in svix_signature.split()))
+    except (ValueError, binascii.Error):
+        pass
+    if not valid:
+        raise HTTPException(401, "Invalid webhook signature.")
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -833,7 +847,7 @@ def setup_2fa(request: Request):
         _, user = current_workspace(request, db)
         secret = pyotp.random_base32()
         request.session["pending_totp_secret"] = secret
-        return JSONResponse({"issuer": "TailorMail", "account": user.email, "otpauth_uri": pyotp.TOTP(secret).provisioning_uri(user.email, issuer_name="TailorMail")})
+        return JSONResponse({"issuer": "TailorJobhunt", "account": user.email, "otpauth_uri": pyotp.TOTP(secret).provisioning_uri(user.email, issuer_name="TailorJobhunt")})
 
 
 @app.post("/settings/2fa/enable")
@@ -954,6 +968,209 @@ def remaining_daily_send_budget(db, workspace_id: int | None = None) -> int:
     return max(daily_limit - sent_today, 0)
 
 
+def _job_query(
+    keywords: str,
+    country: str = "",
+    city: str = "",
+    remote_only: bool = False,
+    job_type: str = "",
+    category: str = "",
+    salary_min: int | None = None,
+    posted_within_days: int | None = None,
+    sources: str = "",
+    page: int = 1,
+    page_size: int = 25,
+) -> JobQuery:
+    if len(keywords.strip()) > 250 or len(country.strip()) > 80 or len(city.strip()) > 160:
+        raise HTTPException(400, "Job search filters are too long.")
+    if page < 1 or not 1 <= page_size <= 100:
+        raise HTTPException(400, "page must be positive and page_size must be between 1 and 100.")
+    selected = [value.strip().casefold() for value in sources.split(",") if value.strip()]
+    known = {provider.name for provider in providers()}
+    if selected and not set(selected).issubset(known):
+        raise HTTPException(400, "Unknown job provider selected.")
+    return JobQuery(
+        keywords=keywords.strip(), country=country.strip() or None, city=city.strip() or None,
+        remote_only=remote_only, job_type=job_type.strip() or None, category=category.strip() or None,
+        salary_min=salary_min if salary_min and salary_min > 0 else None,
+        posted_within_days=posted_within_days if posted_within_days and posted_within_days > 0 else None,
+        sources=selected or None, page=page, page_size=page_size,
+    )
+
+
+def _persist_jobs(db, workspace: Workspace, user: User, query: JobQuery, results, statuses) -> list[Job]:
+    persisted: list[Job] = []
+    for result in results:
+        row = db.scalar(select(Job).where(Job.workspace_id == workspace.id, Job.external_id == result.id))
+        data = {
+            "source": result.source, "source_job_id": result.source_job_id, "sources": result.sources or [result.source],
+            "title": result.title[:500], "company_name": result.company_name[:300], "company_website": result.company_website,
+            "location_text": result.location_text, "country_code": result.country_code, "city": result.city,
+            "is_remote": result.is_remote, "job_type": result.job_type, "category": result.category,
+            "salary_min": int(result.salary_min) if result.salary_min is not None else None,
+            "salary_max": int(result.salary_max) if result.salary_max is not None else None,
+            "salary_currency": result.salary_currency, "description": result.description,
+            "apply_url": result.apply_url, "posted_at": result.posted_at, "fetched_at": result.fetched_at,
+            "raw": json.loads(json.dumps(result.raw, default=str)),
+        }
+        if row:
+            for key, value in data.items():
+                setattr(row, key, value)
+        else:
+            row = Job(workspace_id=workspace.id, external_id=result.id, **data)
+            db.add(row)
+        persisted.append(row)
+    db.flush()
+    db.add(JobSearch(
+        workspace_id=workspace.id, user_id=user.id, query={"keywords": query.keywords, "country": query.country, "city": query.city, "remote_only": query.remote_only, "job_type": query.job_type, "category": query.category, "salary_min": query.salary_min, "posted_within_days": query.posted_within_days, "sources": query.sources, "page": query.page, "page_size": query.page_size},
+        result_count=len(persisted), provider_statuses=[status.public() for status in statuses],
+    ))
+    return persisted
+
+
+def _job_payload(db, workspace: Workspace, job: Job) -> dict:
+    saved = bool(db.scalar(select(SavedJob.id).where(SavedJob.workspace_id == workspace.id, SavedJob.job_id == job.id)))
+    contacts = db.scalars(select(CompanyContact).where(CompanyContact.workspace_id == workspace.id, CompanyContact.job_id == job.id).order_by(CompanyContact.confidence.desc(), CompanyContact.verified_mx.desc())).all()
+    return {
+        "id": job.id, "external_id": job.external_id, "source": job.source, "sources": job.sources or [job.source],
+        "title": job.title, "company_name": job.company_name, "company_website": job.company_website,
+        "location_text": job.location_text, "country_code": job.country_code, "city": job.city, "is_remote": job.is_remote,
+        "job_type": job.job_type, "category": job.category, "salary_min": job.salary_min, "salary_max": job.salary_max,
+        "salary_currency": job.salary_currency, "description": job.description, "apply_url": job.apply_url,
+        "posted_at": job.posted_at.isoformat() if job.posted_at else None, "fetched_at": job.fetched_at.isoformat(),
+        "saved": saved,
+        "contacts": [{"id": contact.id, "email": contact.email, "source_url": contact.source_url, "kind": contact.kind, "confidence": contact.confidence, "verified_mx": contact.verified_mx} for contact in contacts],
+    }
+
+
+@app.get("/api/jobs/providers/status")
+def job_provider_status(request: Request):
+    with SessionLocal() as db:
+        current_workspace(request, db)
+    result = []
+    for provider in providers():
+        configured, message = provider.configured()
+        if not provider.enabled():
+            status, message = "skipped", "disabled by environment"
+        elif not configured:
+            status = "skipped"
+        else:
+            status = "ready"
+        result.append({"name": provider.name, "status": status, "message": message})
+    return {"providers": result}
+
+
+@app.get("/api/jobs/search")
+def search_jobs(
+    request: Request,
+    keywords: str = "",
+    country: str = "",
+    city: str = "",
+    remote_only: bool = False,
+    job_type: str = "",
+    category: str = "",
+    salary_min: int | None = None,
+    posted_within_days: int | None = None,
+    sources: str = "",
+    page: int = 1,
+    page_size: int = 25,
+):
+    query = _job_query(keywords, country, city, remote_only, job_type, category, salary_min, posted_within_days, sources, page, page_size)
+    try:
+        results, statuses = asyncio.run(aggregate_search(query))
+    except RuntimeError as exc:
+        raise HTTPException(503, f"Job search is unavailable: {exc}") from exc
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        rows = _persist_jobs(db, workspace, user, query, results, statuses)
+        db.add(AuditLog(workspace_id=workspace.id, user_id=user.id, action="job_search", entity_type="job_search", detail={"keywords": query.keywords, "result_count": len(rows), "providers": [status.public() for status in statuses]}, ip_address=request.client.host if request.client else None))
+        db.commit()
+        return {"jobs": [_job_payload(db, workspace, row) for row in rows], "provider_statuses": [status.public() for status in statuses], "page": query.page, "page_size": query.page_size}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_detail(request: Request, job_id: int):
+    with SessionLocal() as db:
+        workspace, _ = current_workspace(request, db)
+        job = require_owned(db, Job, job_id, workspace)
+        return _job_payload(db, workspace, job)
+
+
+@app.post("/api/jobs/{job_id}/save")
+def save_job(request: Request, job_id: int):
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        job = require_owned(db, Job, job_id, workspace)
+        if not db.scalar(select(SavedJob).where(SavedJob.workspace_id == workspace.id, SavedJob.job_id == job.id)):
+            db.add(SavedJob(workspace_id=workspace.id, user_id=user.id, job_id=job.id))
+            db.add(AuditLog(workspace_id=workspace.id, user_id=user.id, action="job_saved", entity_type="job", entity_id=job.id, detail={"company": job.company_name, "title": job.title}, ip_address=request.client.host if request.client else None))
+            db.commit()
+        return {"ok": True, "job": _job_payload(db, workspace, job)}
+
+
+@app.post("/api/jobs/{job_id}/find-contact")
+def find_job_contact(request: Request, job_id: int):
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        job = require_owned(db, Job, job_id, workspace)
+        found = find_public_company_contacts(job.company_name, job.company_website, job.apply_url)
+        contacts = []
+        for item in found:
+            contact = db.scalar(select(CompanyContact).where(CompanyContact.workspace_id == workspace.id, CompanyContact.job_id == job.id, CompanyContact.email == item["email"]))
+            if not contact:
+                contact = CompanyContact(workspace_id=workspace.id, job_id=job.id, company_name=job.company_name, **item)
+                db.add(contact)
+            else:
+                contact.source_url, contact.kind, contact.confidence, contact.verified_mx = item["source_url"], item["kind"], item["confidence"], item["verified_mx"]
+            contacts.append(contact)
+        db.add(AuditLog(workspace_id=workspace.id, user_id=user.id, action="job_contact_researched", entity_type="job", entity_id=job.id, detail={"found": len(contacts)}, ip_address=request.client.host if request.client else None))
+        db.commit()
+        return {"job_id": job.id, "contacts": [{"id": contact.id, "email": contact.email, "source_url": contact.source_url, "kind": contact.kind, "confidence": contact.confidence, "verified_mx": contact.verified_mx} for contact in contacts], "message": "No public role or generic company email was found. Use the Apply link or enter a verified corporate address manually." if not contacts else ""}
+
+
+@app.post("/api/jobs/{job_id}/suppress")
+def suppress_job_contact(request: Request, job_id: int, email: str = Form("")):
+    normalized = email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+        raise HTTPException(400, "A valid email is required.")
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        job = require_owned(db, Job, job_id, workspace)
+        if not db.scalar(select(Suppression).where(Suppression.workspace_id == workspace.id, Suppression.email == normalized)):
+            db.add(Suppression(workspace_id=workspace.id, email=normalized, domain=normalized.rsplit("@", 1)[1], reason="job_contact_opt_out"))
+            db.add(AuditLog(workspace_id=workspace.id, user_id=user.id, action="job_contact_suppressed", entity_type="job", entity_id=job.id, detail={"email": normalized}, ip_address=request.client.host if request.client else None))
+            db.commit()
+        return {"ok": True, "email": normalized}
+
+
+@app.post("/api/jobs/{job_id}/prepare-application")
+def prepare_job_application(request: Request, job_id: int, candidate_id: int = Form(), recipient_email: str = Form("")):
+    with SessionLocal() as db:
+        workspace, user = current_workspace(request, db)
+        require_feature(db, workspace, "ai_tailoring")
+        job = require_owned(db, Job, job_id, workspace)
+        candidate = require_owned(db, Candidate, candidate_id, workspace)
+        selected_email = recipient_email.strip().lower()
+        if not selected_email:
+            contact = db.scalar(select(CompanyContact).where(CompanyContact.workspace_id == workspace.id, CompanyContact.job_id == job.id).order_by(CompanyContact.confidence.desc(), CompanyContact.verified_mx.desc()))
+            selected_email = contact.email if contact else ""
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", selected_email) or not corporate_recipient(selected_email):
+            raise HTTPException(400, "Find a public company contact or enter a verified corporate email before preparing an application.")
+        domain = selected_email.rsplit("@", 1)[1]
+        suppressed = db.scalar(select(Suppression).where((Suppression.email == selected_email) | (Suppression.domain == domain), (Suppression.workspace_id == workspace.id) | Suppression.workspace_id.is_(None)))
+        if suppressed:
+            raise HTTPException(400, "This recipient is suppressed and cannot be contacted.")
+        campaign = Campaign(workspace_id=workspace.id, user_id=user.id, candidate_id=candidate.id, job_id=job.id, company_name=job.company_name, company_url=job.company_website, target_role=job.title, job_description=job.description, recipient_email=selected_email, status="queued")
+        db.add(campaign)
+        db.flush()
+        audit(db, campaign, "created_from_job", f"Application created from {job.source} job {job.external_id}.", user.id)
+        queued_id = enqueue_job("prepare_campaign", {"campaign_id": campaign.id, "source": "job"}, workspace.id, user.id)
+        audit(db, campaign, "queued", f"Research and tailoring queued as job {queued_id}.", user.id)
+        db.add(AuditLog(workspace_id=workspace.id, user_id=user.id, action="job_application_prepared", entity_type="job", entity_id=job.id, detail={"campaign_id": campaign.id, "recipient": selected_email}, ip_address=request.client.host if request.client else None))
+        db.commit()
+        return {"ok": True, "campaign_id": campaign.id, "job_id": queued_id, "review_url": f"/campaigns/{campaign.id}"}
+
+
 @app.get("/")
 def dashboard(request: Request, tab: str = "applications"):
     if settings.environment == "production" and not request.session.get("authenticated"):
@@ -972,6 +1189,10 @@ def dashboard(request: Request, tab: str = "applications"):
         notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(20)).all()
         blocklist = db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id, Suppression.reason == "workspace_blocklist").order_by(Suppression.created_at.desc())).all()
         jobs = db.scalars(select(OutreachJob).where(OutreachJob.workspace_id == workspace.id).order_by(OutreachJob.created_at.desc()).limit(10)).all()
+        saved_jobs = db.scalars(
+            select(Job).join(SavedJob, SavedJob.job_id == Job.id).where(SavedJob.workspace_id == workspace.id).order_by(SavedJob.created_at.desc()).limit(20)
+        ).all()
+        job_searches = db.scalars(select(JobSearch).where(JobSearch.workspace_id == workspace.id).order_by(JobSearch.created_at.desc()).limit(5)).all()
         email_account = db.scalar(select(EmailAccount).where(EmailAccount.workspace_id == workspace.id, EmailAccount.status == "active").order_by(EmailAccount.id))
         ai_config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
         return templates.TemplateResponse(
@@ -993,6 +1214,8 @@ def dashboard(request: Request, tab: str = "applications"):
                 "ai_config": ai_config,
                 "blocklist": blocklist,
                 "jobs": jobs,
+                "saved_jobs": saved_jobs,
+                "job_searches": job_searches,
                 "announcement": announcement,
             },
         )
@@ -1243,7 +1466,7 @@ def admin_reset_password(request: Request, user_id: int):
         db.add(AuditLog(workspace_id=None, user_id=actor.id, action="admin_password_reset_requested", entity_type="user", entity_id=target.id, detail={}))
         db.commit()
         try:
-            send_system_email(target.email, "Reset your TailorMail password", f"An administrator requested a password reset. Use {settings.base_url}/reset-password?token={raw} within one hour.")
+            send_system_email(target.email, "Reset your TailorJobhunt password", f"An administrator requested a password reset. Use {settings.base_url}/reset-password?token={raw} within one hour.")
         except Exception:
             logging.getLogger("tailormail").warning("Could not send admin password reset email", exc_info=True)
     return RedirectResponse("/admin", status_code=303)
@@ -1834,6 +2057,23 @@ def send_campaign(campaign_id: int, approved: bool = Form(False), request: Reque
         suppressed = db.scalar(select(Suppression).where(Suppression.email == (recipient or "").lower(), (Suppression.workspace_id == workspace.id) | Suppression.workspace_id.is_(None))) or db.scalar(select(Suppression).where(Suppression.domain == recipient_domain, (Suppression.workspace_id == workspace.id) | Suppression.workspace_id.is_(None)))
         if suppressed:
             raise HTTPException(400, "This recipient is suppressed and cannot be contacted.")
+        campaign = require_owned(db, Campaign, campaign_id, workspace)
+        cooldown_start = utc_now() - timedelta(days=max(settings.contact_cooldown_days, 0))
+        if settings.contact_cooldown_days > 0:
+            recent_campaigns = db.scalars(
+                select(Campaign).where(
+                    Campaign.workspace_id == workspace.id,
+                    Campaign.status == "sent",
+                    Campaign.sent_at >= cooldown_start,
+                    Campaign.id != campaign_id,
+                )
+            ).all()
+            if any(
+                sent.company_name.casefold() == campaign.company_name.casefold()
+                or ("@" in sent.recipient_email and sent.recipient_email.rsplit("@", 1)[-1].casefold() == recipient_domain)
+                for sent in recent_campaigns
+            ):
+                raise HTTPException(400, f"This company domain was contacted within the {settings.contact_cooldown_days}-day cooldown window.")
         claimed = db.execute(
             update(Campaign)
             .where(Campaign.id == campaign_id, Campaign.status == "ready", workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None))

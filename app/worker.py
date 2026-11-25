@@ -40,7 +40,7 @@ def run() -> None:
             elif job.get("type") == "trial_reminder":
                 from .services import send_system_email
                 days_left = job.get("days_left", 0)
-                send_system_email(job["email"], "Your TailorMail trial is ending", f"Your TailorMail trial has {days_left} day(s) remaining. Review billing at {settings.base_url}/billing.")
+                send_system_email(job["email"], "Your TailorJobhunt trial is ending", f"Your TailorJobhunt trial has {days_left} day(s) remaining. Review billing at {settings.base_url}/billing.")
             else:
                 log.warning("Unknown job type: %s", job.get("type"))
             if job_id and job.get("type") != "daily_outreach":

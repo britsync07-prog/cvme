@@ -1,0 +1,9 @@
+[Unit]
+Description=CVME PostgreSQL and artifact backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/cvme
+ExecStart=/opt/cvme/deploy/backup.sh /opt/cvme /var/backups/cvme

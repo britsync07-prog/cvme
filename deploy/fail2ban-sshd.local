@@ -1,0 +1,8 @@
+[sshd]
+enabled = true
+mode = aggressive
+backend = systemd
+port = ssh
+maxretry = 5
+findtime = 10m
+bantime = 1d

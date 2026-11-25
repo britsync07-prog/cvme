@@ -59,6 +59,6 @@ def mark_job(job_id: int, status: str, *, progress: int | None = None, error: st
             job.attempts = attempts
         if status == "running" and not job.started_at:
             job.started_at = utc_now()
-        if status in {"succeeded", "failed", "cancelled"}:
+        if status in {"succeeded", "partial", "failed", "cancelled"}:
             job.finished_at = utc_now()
         db.commit()

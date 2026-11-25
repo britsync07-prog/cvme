@@ -1,5 +1,5 @@
 [Unit]
-Description=Run TailorMail daily outreach batch
+Description=Run TailorJobhunt daily outreach batch
 
 [Timer]
 OnCalendar=*-*-* 09:00:00

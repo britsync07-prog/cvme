@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TailorMail · Intelligent RenderCV Application Studio</title>
+  <title>TailorJobhunt - Intelligent RenderCV Application Studio</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <div class="app-layout">
   <header class="top-nav">
     <div class="brand">
-      <div class="logo-mark">TM</div>
+      <div class="logo-mark">TJ</div>
       <div>
-        <span class="app-title">TailorMail</span>
+        <span class="app-title">TailorJobhunt</span>
         <span class="app-tagline">RenderCV Builder & Tailored Outreach System</span>
       </div>
     </div>
@@ -32,6 +32,7 @@
       New Application
     </a>
     <a href="/?tab=leads" class="tab-item {% if active_tab == 'leads' %}active{% endif %}">Lead discovery</a>
+    <a href="/?tab=jobs" class="tab-item {% if active_tab == 'jobs' %}active{% endif %}">Jobs</a>
     <a href="/?tab=candidates" class="tab-item {% if active_tab == 'candidates' %}active{% endif %}">
       Candidates
       <span class="tab-count">{{ candidates|length }}</span>
@@ -254,6 +255,21 @@
       <p>Add a candidate first. A candidate CV is required before a tailored application can be created.</p>
       {% endif %}
     </div>
+
+    {% elif active_tab == 'jobs' %}
+    <section class="panel form-panel jobs-panel">
+      <div class="panel-header"><div><h1>Jobs</h1><p class="subtitle">Search permitted job sources, open the application link, then prepare a company-specific CV and email for review.</p></div></div>
+      <form id="job-search-form" class="standard-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <div class="form-row"><label class="field"><span>Keywords</span><input name="keywords" placeholder="e.g. warehouse operative, nurse, Python engineer" required></label><label class="field"><span>Country</span><select name="country"><option value="">Any country</option><option value="GB">United Kingdom</option><option value="US">United States</option><option value="BD">Bangladesh</option><option value="DE">Germany</option><option value="CA">Canada</option><option value="AU">Australia</option></select></label></div>
+        <div class="form-row"><label class="field"><span>City</span><input name="city" placeholder="Optional"></label><label class="field"><span>Job type</span><select name="job_type"><option value="">Any type</option><option>Full Time</option><option>Part Time</option><option>Contract</option><option>Temporary</option><option>Internship</option></select></label></div>
+        <div class="form-row"><label class="field"><span>Category</span><select name="category"><option value="">All categories</option><option>IT</option><option>Non-IT</option><option>Physical / frontline</option></select></label><label class="field"><span>Minimum salary</span><input name="salary_min" type="number" min="0" placeholder="Optional"></label><label class="field"><span>Posted within</span><select name="posted_within_days"><option value="">Any time</option><option value="1">24 hours</option><option value="7">7 days</option><option value="30">30 days</option></select></label></div>
+        <div class="form-options"><label class="checkbox-label"><input name="remote_only" type="checkbox" value="true"><span>Remote only</span></label></div>
+        <div class="form-actions"><button id="job-search-button" class="button primary" type="submit">Search jobs</button><span id="job-search-message" class="muted" aria-live="polite"></span></div>
+      </form>
+      <div id="job-results" class="job-results"><div class="empty-state"><div class="empty-icon">ðŸ’¼</div><h3>Search jobs across enabled sources</h3><p>Results are saved to your workspace. Sending remains review-first.</p></div></div>
+    </section>
+    {% if saved_jobs %}<section class="panel"><div class="panel-header"><div><h2>Saved jobs</h2><p class="subtitle">Your recently saved opportunities.</p></div></div><div class="job-results">{% for job in saved_jobs %}<article class="job-card"><div><div class="job-card-title"><h3>{{ job.title }}</h3></div><p><strong>{{ job.company_name }}</strong> · {{ job.location_text or 'Location not specified' }}</p><a href="{{ job.apply_url }}" target="_blank" rel="noopener noreferrer" class="site-link">Open Apply link</a></div><button class="button small secondary" type="button" onclick="openSavedJob({{ job.id }})">View</button></article>{% endfor %}</div></section>{% endif %}
 
     {% elif active_tab == 'candidates' %}
     <!-- CANDIDATES TAB -->
@@ -521,7 +537,7 @@
   </main>
 </div>
 
-<script>
+<script nonce="{{ csp_nonce(request) }}">
 async function testLLM() {
   const el = document.getElementById('llm-test-result');
   el.className = 'test-feedback pending';
@@ -582,6 +598,72 @@ async function setup2FA() {
   alert('Add this URI to your authenticator app:\n' + data.otpauth_uri);
   document.getElementById('twofa-form').style.display = 'flex';
 }
+
+const jobCandidates = {{ candidates|map(attribute='id')|list|tojson }};
+const jobCandidateNames = {{ candidates|map(attribute='name')|list|tojson }};
+const esc = (value) => String(value || '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
+const jobCsrf = () => document.querySelector('#job-search-form input[name="csrf_token"]')?.value || document.querySelector('input[name="csrf_token"]')?.value || '';
+async function loadJobProviders() {
+  const holder = document.getElementById('job-provider-checkboxes');
+  if (!holder) return;
+  const response = await fetch('/api/jobs/providers/status');
+  if (!response.ok) return;
+  const data = await response.json();
+  holder.innerHTML = data.providers.map(p => `<label class="checkbox-label"><input type="checkbox" name="source" value="${esc(p.name)}" ${p.status === 'ready' ? '' : 'disabled'}><span>${esc(p.name)} ${p.status === 'ready' ? '' : '(' + esc(p.message || p.status) + ')'}</span></label>`).join('');
+}
+function renderProviderStatuses(statuses) {
+  const holder = document.getElementById('job-provider-statuses');
+  if (!holder) return;
+  holder.innerHTML = statuses.map(item => `<span class="provider-chip provider-${esc(item.status)}">${esc(item.name)}: ${esc(item.status)}${item.message ? ' (' + esc(item.message) + ')' : ''}${item.status === 'ok' ? ' · ' + Number(item.count || 0) : ''}</span>`).join('');
+}
+function jobSalary(job) {
+  if (!job.salary_min && !job.salary_max) return '';
+  const currency = job.salary_currency ? job.salary_currency + ' ' : '';
+  return currency + [job.salary_min, job.salary_max].filter(Boolean).join('–');
+}
+function renderJobs(jobs) {
+  const holder = document.getElementById('job-results');
+  if (!holder) return;
+  if (!jobs.length) { holder.innerHTML = '<div class="empty-state"><h3>No matching jobs</h3><p>Try a different role, country, or location.</p></div>'; return; }
+  holder.innerHTML = jobs.map(job => `<article class="job-card" data-job-id="${job.id}"><div class="job-card-main"><div class="job-card-title"><h3>${esc(job.title)}</h3></div><p><strong>${esc(job.company_name)}</strong> · ${esc(job.location_text || (job.is_remote ? 'Remote' : 'Location not specified'))}${jobSalary(job) ? ' · ' + esc(jobSalary(job)) : ''}</p><p class="job-description">${esc((job.description || '').slice(0, 420))}</p><div class="job-contacts">${job.contacts?.length ? job.contacts.map(contact => '<span class="contact-chip">' + esc(contact.email) + (contact.verified_mx ? ' · MX' : '') + '</span>').join('') : '<span class="muted">No public contact researched yet.</span>'}</div></div><div class="job-actions"><a class="button small secondary" href="${esc(job.apply_url)}" target="_blank" rel="noopener noreferrer">Apply</a><button class="button small ghost" type="button" onclick="findJobContact(${job.id})">Find company email</button><button class="button small primary" type="button" onclick="prepareJobApplication(${job.id})">Tailor &amp; Email</button><button class="button small ghost" type="button" onclick="saveJob(${job.id})">${job.saved ? 'Saved' : 'Save'}</button>${job.contacts?.length ? '<button class="button small ghost" type="button" onclick="suppressJobContact(' + job.id + ')">Suppress contact</button>' : ''}</div></article>`).join('');
+}
+async function postJob(path, data = new FormData()) {
+  if (!data.has('csrf_token')) data.append('csrf_token', jobCsrf());
+  const response = await fetch(path, {method: 'POST', body: data});
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.detail || 'Request failed');
+  return payload;
+}
+async function findJobContact(jobId) {
+  const button = document.querySelector(`[data-job-id="${jobId}"] .job-actions button`);
+  if (button) button.disabled = true;
+  try { const data = await postJob(`/api/jobs/${jobId}/find-contact`); alert(data.contacts.length ? 'Found: ' + data.contacts.map(contact => contact.email).join(', ') : data.message); await openSavedJob(jobId); } catch (error) { alert(error.message); } finally { if (button) button.disabled = false; }
+}
+async function saveJob(jobId) {
+  try { await postJob(`/api/jobs/${jobId}/save`); const button = document.querySelector(`[data-job-id="${jobId}"] .job-actions button:last-child`); if (button) button.textContent = 'Saved'; } catch (error) { alert(error.message); }
+}
+async function suppressJobContact(jobId) {
+  const email = prompt('Email address to suppress for this workspace:'); if (!email) return;
+  const data = new FormData(); data.append('email', email);
+  try { await postJob(`/api/jobs/${jobId}/suppress`, data); alert(`${email} added to this workspace suppression list.`); } catch (error) { alert(error.message); }
+}
+async function prepareJobApplication(jobId) {
+  if (!jobCandidates.length) { alert('Add a candidate CV before preparing an application.'); return; }
+  const candidateChoices = jobCandidates.map((id, index) => `${index + 1}. ${jobCandidateNames[index]}`).join('\n');
+  const choice = prompt(`Choose candidate:\n${candidateChoices}`, '1');
+  if (!choice) return;
+  const index = Number(choice) - 1;
+  if (!jobCandidates[index]) { alert('Choose a listed candidate number.'); return; }
+  const data = new FormData(); data.append('candidate_id', jobCandidates[index]);
+  try { const result = await postJob(`/api/jobs/${jobId}/prepare-application`, data); window.location.href = result.review_url; } catch (error) { const email = prompt(error.message + '\n\nEnter a verified corporate company email, or cancel:'); if (!email) return; data.set('recipient_email', email); try { const result = await postJob(`/api/jobs/${jobId}/prepare-application`, data); window.location.href = result.review_url; } catch (retryError) { alert(retryError.message); } }
+}
+async function openSavedJob(jobId) { try { const job = await (await fetch(`/api/jobs/${jobId}`)).json(); renderJobs([job]); window.scrollTo({top: 0, behavior: 'smooth'}); } catch (error) { alert('Could not load job.'); } }
+document.getElementById('job-search-form')?.addEventListener('submit', async event => {
+  event.preventDefault(); const form = new FormData(event.currentTarget); const button = document.getElementById('job-search-button'); const message = document.getElementById('job-search-message');
+  const params = new URLSearchParams(); for (const [key, value] of form.entries()) { if (key !== 'csrf_token' && value) params.append(key, value); }
+  button.disabled = true; message.textContent = 'Searching jobs…';
+  try { const response = await fetch('/api/jobs/search?' + params); const data = await response.json(); if (!response.ok) throw new Error(data.detail || 'Search failed'); renderJobs(data.jobs); message.textContent = data.jobs.length ? `${data.jobs.length} opportunities found.` : 'No matching opportunities found.'; } catch (error) { message.textContent = 'Unable to search jobs right now. Please try again.'; } finally { button.disabled = false; }
+});
 </script>
 </body>
 </html>

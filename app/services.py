@@ -220,7 +220,15 @@ def research_company(
         raise ValueError("Provide a company website or target role/job description.")
 
     if job_description and not any(s.get("url") == "user-input" for s in sources):
-        add_source("user-input", job_description[:JOB_CONTEXT_MAX_CHARS])
+        # The verified public employer recipient is appended to job listings
+        # by the daily worker. Keep that evidence at the beginning so compact
+        # research does not trim it away and later block a valid send.
+        public_emails = sorted({email.casefold() for email in EMAIL_RE.findall(job_description)})
+        evidence = (
+            f"Public employer recipient evidence: {', '.join(public_emails)}.\n\n"
+            if public_emails else ""
+        )
+        add_source("user-input", evidence + job_description[:JOB_CONTEXT_MAX_CHARS])
 
     return {
         "company": name,

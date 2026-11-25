@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     outreach_timezone: str = "Asia/Dhaka"
     outreach_max_search_pages: int = 10
     outreach_search_page_size: int = 100
+    outreach_retry_minutes: int = 60
     outreach_min_delay_seconds: int = 5
     outreach_max_delay_seconds: int = 15
     outreach_kill_switch: bool = False

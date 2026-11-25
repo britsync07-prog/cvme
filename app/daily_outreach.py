@@ -57,6 +57,8 @@ def production_preflight_errors(workspace_id: int | None = None) -> list[str]:
         errors.append("OUTREACH_MAX_SEARCH_PAGES must be between 1 and 25.")
     if not 25 <= settings.outreach_search_page_size <= 100:
         errors.append("OUTREACH_SEARCH_PAGE_SIZE must be between 25 and 100.")
+    if not 15 <= settings.outreach_retry_minutes <= 360:
+        errors.append("OUTREACH_RETRY_MINUTES must be between 15 and 360.")
     if not settings.api_key or not settings.base_url or not settings.llm_model:
         errors.append("BASE_URL, API_KEY, and LLM_MODEL are required.")
     if workspace_auto_send:

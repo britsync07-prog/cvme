@@ -13,7 +13,7 @@ from sqlalchemy import select
 from .config import settings
 from .db import SessionLocal
 from .jobs import JobQuery, aggregate_search, find_public_company_contacts
-from .main import _persist_jobs, create_campaign, remaining_daily_send_budget, send_campaign
+from .main import _persist_jobs, create_campaign, prepare_campaign, remaining_daily_send_budget, send_campaign
 from .models import Campaign, Candidate, EmailAccount, User, Workspace
 from .ops import kill_switch_enabled, mark_job
 from .services import cv_outreach_readiness_error
@@ -148,13 +148,29 @@ def discover_job_batch(
                 return
             with SessionLocal() as db:
                 existing = db.scalar(
-                    select(Campaign.id).where(
+                    select(Campaign).where(
                         Campaign.workspace_id == (workspace_id or ensure_default_workspace(db)[0].id),
                         Campaign.job_id == job["id"],
                         Campaign.deleted_at.is_(None),
                     )
                 )
             if existing:
+                # A deploy or transient worker failure can leave a campaign in
+                # researching/failed state. Resume it on the next source pass
+                # rather than losing that verified employer contact forever.
+                try:
+                    if existing.status in {"queued", "researching", "failed"}:
+                        prepare_campaign(existing.id, workspace_id=workspace_id)
+                        totals["completed"] += 1
+                    elif existing.status != "ready":
+                        continue
+                    if send_when_ready:
+                        send_campaign(existing.id, approved=True, workspace_id=workspace_id)
+                        totals["sent"] += 1
+                        if settings.environment == "production":
+                            time.sleep(random.uniform(max(settings.outreach_min_delay_seconds, 0), max(settings.outreach_max_delay_seconds, settings.outreach_min_delay_seconds)))
+                except HTTPException:
+                    continue
                 continue
 
             try:

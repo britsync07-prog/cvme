@@ -51,7 +51,7 @@
         <span class="step-num">1</span>
         <span class="step-label">Application Created</span>
       </div>
-      <div class="step {% if campaign.status in ['ready', 'sending', 'sent'] %}complete{% elif campaign.status in ['queued', 'researching'] %}active{% else %}pending{% endif %}">
+      <div class="step {% if campaign.status in ['ready', 'sending', 'sent'] %}complete{% elif campaign.status in ['queued', 'researching', 'waiting_for_ai'] %}active{% else %}pending{% endif %}">
         <span class="step-num">2</span>
         <span class="step-label">Research & RenderCV Tailor</span>
       </div>
@@ -86,6 +86,10 @@
 
     {% if campaign.status in ['queued', 'researching'] %}
     <div class="panel trial-banner"><strong>Tailoring in progress.</strong> Research, AI validation, and RenderCV compilation are running in the background. Refresh this page for progress.</div>
+    {% endif %}
+
+    {% if campaign.status == 'waiting_for_ai' %}
+    <div class="panel trial-banner"><strong>Waiting for the AI provider.</strong> Automatic preparation will resume after the provider cooldown. No email has been sent.</div>
     {% endif %}
 
     {% if campaign.status in ['ready', 'sent', 'send_uncertain'] %}

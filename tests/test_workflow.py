@@ -19,7 +19,7 @@ from app import daily_outreach, services
 from app.db import Base, SessionLocal, engine
 from app.main import app
 import app.main as main
-from app.models import Campaign, Candidate
+from app.models import AuditEvent, Campaign, Candidate
 from app.tenancy import ensure_default_workspace
 
 
@@ -91,6 +91,44 @@ def test_healthz_is_available_with_dashboard_auth_configured(monkeypatch):
         response = client.get("/healthz")
 
     assert response.status_code == 200
+
+
+def test_dashboard_pages_and_filters_large_application_queues():
+    with SessionLocal() as db:
+        workspace, user = ensure_default_workspace(db)
+        candidate = Candidate(
+            workspace_id=workspace.id,
+            user_id=user.id,
+            name="Test Person",
+            email="person@example.com",
+            cv_yaml="cv:\n  name: Test Person\n  sections: {}\n",
+        )
+        db.add(candidate)
+        db.flush()
+        db.add_all([
+            Campaign(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                candidate_id=candidate.id,
+                company_name=f"Company {number:03d}",
+                recipient_email=f"jobs{number}@company.example",
+                status="ready" if number == 104 else "sent",
+            )
+            for number in range(105)
+        ])
+        db.commit()
+
+    with TestClient(app, base_url="http://localhost") as client:
+        third_page = client.get("/?tab=applications&page=3")
+        filtered = client.get("/?tab=applications&status=ready&q=Company+104")
+
+    assert third_page.status_code == 200
+    assert "Application queue" in third_page.text
+    assert 'aria-current="page">3' in third_page.text
+    assert third_page.text.count('class="status-badge') == 5
+    assert filtered.status_code == 200
+    assert "Company 104" in filtered.text
+    assert "1 matching applications" in filtered.text
 
 
 def test_resend_webhook_requires_a_verification_secret(monkeypatch):
@@ -685,8 +723,10 @@ def test_llm_url_accepts_provider_v1_base_url():
     assert services._llm_url("http://provider.test/v1", "models") == "http://provider.test/v1/models"
 
 
-def test_llm_request_retries_transport_errors():
+def test_llm_request_retries_transport_errors(monkeypatch):
     calls = 0
+
+    monkeypatch.setattr(services.settings, "llm_request_attempts", 3)
 
     def request(*args, **kwargs):
         nonlocal calls
@@ -697,6 +737,68 @@ def test_llm_request_retries_transport_errors():
 
     assert services._llm_request(request, "https://provider.test") == "response"
     assert calls == 3
+
+
+def test_tailor_opens_circuit_for_transient_provider_errors(monkeypatch):
+    source = "cv:\n  name: Test Person\n  email: test@example.com\n  sections: {}\n"
+    request = services.httpx.Request("POST", "https://provider.test/v1/chat/completions")
+    response = services.httpx.Response(503, request=request)
+    opened = []
+
+    monkeypatch.setattr(services.settings, "api_key", "test-key")
+    monkeypatch.setattr(services, "llm_circuit_open", lambda _base_url: False)
+    monkeypatch.setattr(services, "_open_llm_circuit", lambda base_url: opened.append(base_url))
+    monkeypatch.setattr(services.httpx, "post", lambda *args, **kwargs: response)
+
+    with pytest.raises(services.LLMProviderUnavailable, match="temporarily unavailable"):
+        services.tailor(source, {"sources": []}, "Acme Corp")
+    assert opened == [services.settings.base_url]
+
+
+def test_tailor_fails_fast_when_circuit_is_open(monkeypatch):
+    source = "cv:\n  name: Test Person\n  email: test@example.com\n  sections: {}\n"
+
+    monkeypatch.setattr(services.settings, "api_key", "test-key")
+    monkeypatch.setattr(services, "llm_circuit_open", lambda _base_url: True)
+    monkeypatch.setattr(services.httpx, "post", lambda *args, **kwargs: pytest.fail("provider should not be called"))
+
+    with pytest.raises(services.LLMProviderUnavailable, match="temporarily unavailable"):
+        services.tailor(source, {"sources": []}, "Acme Corp")
+
+
+def test_prepare_campaign_waits_for_ai_without_recording_provider_details(monkeypatch):
+    candidate_id = _outreach_ready_candidate_id()
+    with SessionLocal() as db:
+        workspace, user = ensure_default_workspace(db)
+        candidate = db.get(Candidate, candidate_id)
+        candidate.workspace_id = workspace.id
+        candidate.user_id = user.id
+        campaign = Campaign(
+            workspace_id=workspace.id,
+            user_id=user.id,
+            candidate_id=candidate.id,
+            company_name="Acme Corp",
+            company_url="https://acme.example",
+            target_role="Backend Engineer",
+            recipient_email="careers@acme.example",
+            status="queued",
+        )
+        db.add(campaign)
+        db.commit()
+        campaign_id, workspace_id = campaign.id, workspace.id
+
+    monkeypatch.setattr(main, "llm_circuit_open", lambda _base_url: True)
+    with pytest.raises(Exception) as error:
+        main.prepare_campaign(campaign_id, workspace_id=workspace_id)
+
+    assert error.value.status_code == 503
+    with SessionLocal() as db:
+        campaign = db.get(Campaign, campaign_id)
+        event = db.query(AuditEvent).filter_by(campaign_id=campaign_id).one()
+    assert campaign.status == "waiting_for_ai"
+    assert event.action == "waiting_for_ai"
+    assert "cooldown" in event.detail
+    assert "http" not in event.detail.casefold()
 
 
 def test_tailor_retries_malformed_json_until_valid_response(monkeypatch):

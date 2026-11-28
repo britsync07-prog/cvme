@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     # unavailable.  These bounds apply to each CV/email tailoring attempt.
     llm_timeout_seconds: int = 60
     llm_request_attempts: int = 2
+    llm_circuit_breaker_seconds: int = 900
     contact_cooldown_days: int = 30
     scrapollo_binary: str = "scrapollo"
     scrapollo_cookie_file: str = ""

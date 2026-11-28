@@ -159,7 +159,7 @@ def discover_job_batch(
                 # researching/failed state. Resume it on the next source pass
                 # rather than losing that verified employer contact forever.
                 try:
-                    if existing.status in {"queued", "researching", "failed"}:
+                    if existing.status in {"queued", "researching", "failed", "waiting_for_ai"}:
                         prepare_campaign(existing.id, workspace_id=workspace_id)
                         totals["completed"] += 1
                     elif existing.status != "ready":

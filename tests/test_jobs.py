@@ -60,6 +60,63 @@ def test_partial_provider_failure_is_returned(monkeypatch):
     assert {item.name: item.status for item in statuses} == {"good": "ok", "bad": "failed"}
 
 
+def test_persist_jobs_bounds_provider_fields_and_normalizes_non_finite_json():
+    listing = normalized()
+    listing.location_text = "L" * 700
+    listing.source_job_id = "I" * 400
+    listing.company_website = "https://employer.example/" + ("p" * 1_100)
+    listing.raw = {"score": float("nan"), "nested": [float("inf"), {"value": float("-inf")}]} 
+    statuses = [jobs.ProviderStatus("fixture", "ok", count=1)]
+
+    with SessionLocal() as db:
+        workspace, user = ensure_default_workspace(db)
+        persisted = main._persist_jobs(
+            db,
+            workspace,
+            user,
+            jobs.JobQuery(keywords="warehouse"),
+            [listing],
+            statuses,
+        )
+        db.commit()
+        stored = db.get(Job, persisted[0].id)
+
+    assert len(stored.location_text) == 500
+    assert len(stored.source_job_id) == 255
+    assert len(stored.company_website) == 1_000
+    assert stored.raw == {"score": None, "nested": [None, {"value": None}]}
+    assert all(status.name != "storage" for status in statuses)
+
+
+def test_persist_jobs_skips_one_malformed_listing_without_aborting_page():
+    valid = normalized(source="valid")
+    malformed = normalized(source="broken", apply_url="https://employer.example/broken")
+    malformed.id = ""
+    statuses = [jobs.ProviderStatus("fixture", "ok", count=2)]
+
+    with SessionLocal() as db:
+        workspace, user = ensure_default_workspace(db)
+        persisted = main._persist_jobs(
+            db,
+            workspace,
+            user,
+            jobs.JobQuery(keywords="warehouse"),
+            [valid, malformed],
+            statuses,
+        )
+        db.commit()
+        total = db.query(Job).count()
+
+    assert len(persisted) == 1
+    assert total == 1
+    assert statuses[-1].public() == {
+        "name": "storage",
+        "status": "partial",
+        "message": "Skipped 1 malformed listing(s).",
+        "count": 1,
+    }
+
+
 def test_contact_ranking_and_public_domain_only():
     assert jobs.rank_contact("careers@acme.example", "acme.example")[1] == "role"
     assert jobs.rank_contact("recruiting-emea@acme.example", "acme.example")[1] == "role"

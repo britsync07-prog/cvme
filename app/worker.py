@@ -3,6 +3,9 @@ import json
 import logging
 import time
 import redis
+import httpx
+from redis.exceptions import RedisError
+from sqlalchemy.exc import DataError, IntegrityError, OperationalError, StatementError
 
 from .config import settings
 from .ops import mark_job
@@ -10,6 +13,32 @@ from .db import SessionLocal
 from .models import OutreachJob
 
 log = logging.getLogger("tailormail.worker")
+MAX_RETRY_ATTEMPTS = 3
+
+
+def classify_job_failure(exc: BaseException) -> tuple[bool, str]:
+    """Return whether a queue job is safe to retry and a non-sensitive reason."""
+    if isinstance(exc, SystemExit):
+        return False, "preflight_failed"
+    if isinstance(exc, OperationalError):
+        return True, "database_unavailable"
+    if isinstance(exc, (DataError, IntegrityError, StatementError, ValueError, TypeError, KeyError)):
+        return False, "invalid_data_or_configuration"
+    if isinstance(exc, (httpx.RequestError, RedisError, TimeoutError, ConnectionError)):
+        return True, "external_service_unavailable"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        if status_code == 429 or status_code >= 500:
+            return True, f"http_{status_code}"
+        return False, f"http_{status_code}"
+    return False, "unexpected_failure"
+
+
+def _attempt_count(job: dict) -> int:
+    try:
+        return max(int(job.get("attempts", 0)), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def run() -> None:
@@ -27,7 +56,7 @@ def run() -> None:
                     durable = db.get(OutreachJob, int(job_id))
                     if durable and durable.status == "cancelled":
                         continue
-                mark_job(int(job_id), "running", progress=1, attempts=int(job.get("attempts", 0)))
+                mark_job(int(job_id), "running", progress=1, attempts=_attempt_count(job))
             lock_key = f"tailormail:running:{job.get('type')}:{job.get('workspace_id', 'global')}"
             if not client.set(lock_key, "1", nx=True, ex=7200):
                 # Another worker owns this job type. Preserve the durable job
@@ -56,16 +85,33 @@ def run() -> None:
             if job_id and job.get("type") != "daily_outreach":
                 mark_job(int(job_id), "succeeded", progress=100)
         except (Exception, SystemExit) as exc:
-            log.exception("Outreach job failed")
+            retryable, reason = classify_job_failure(exc)
+            attempts = _attempt_count(job) + 1
+            log.warning(
+                "outreach_job_failed type=%s retryable=%s reason=%s attempt=%s",
+                job.get("type", "unknown"),
+                retryable,
+                reason,
+                attempts,
+            )
+            should_retry = retryable and attempts < MAX_RETRY_ATTEMPTS
             if job.get("job_id"):
-                mark_job(int(job["job_id"]), "failed", progress=100, error=str(exc)[:2000] or "Job failed; see worker logs.", attempts=int(job.get("attempts", 0)) + 1)
-            try:
-                attempts = int(job.get("attempts", 0)) + 1
-                if attempts < 5:
+                mark_job(
+                    int(job["job_id"]),
+                    "queued" if should_retry else "failed",
+                    progress=0 if should_retry else 100,
+                    error=f"{reason} ({'retrying' if should_retry else 'not retried'})",
+                    attempts=attempts,
+                )
+            if should_retry:
+                try:
                     job["attempts"] = attempts
+                    # The small bounded delay prevents immediate retry storms;
+                    # circuit breaking handles longer provider outages separately.
+                    time.sleep(min(2 ** attempts, 8))
                     client.lpush("tailormail:jobs", json.dumps(job))
-            except Exception:
-                log.exception("Could not requeue failed job")
+                except Exception:
+                    log.warning("outreach_job_requeue_failed type=%s", job.get("type", "unknown"))
         finally:
             if lock_key and lock_acquired:
                 client.delete(lock_key)

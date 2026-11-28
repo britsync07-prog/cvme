@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime, timedelta, timezone
+import math
 from pathlib import Path
 import base64
 import binascii
@@ -23,7 +24,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text, update
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError, StatementError
+from sqlalchemy.orm import selectinload
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -32,13 +34,15 @@ from .config import settings, update_settings
 from .db import Base, SessionLocal, engine
 from .entitlements import require_candidate_slot, require_feature, require_send_slot, status_for
 from .models import AIProviderConfig, AuditEvent, AuditLog, BillingEvent, Campaign, Candidate, CompanyContact, Coupon, EmailAccount, EmailVerificationToken, Invoice, Job, JobSearch, Notification, OutreachJob, PasswordResetToken, Payment, Plan, SavedJob, SessionToken, Subscription, SupportTicket, Suppression, UsageRecord, User, Workspace, WorkspaceMembership
-from .jobs import JobQuery, aggregate_search, find_public_company_contacts, providers
+from .jobs import JobQuery, ProviderStatus, aggregate_search, find_public_company_contacts, providers
 from .ops import enqueue_job, kill_switch_enabled, mark_job, set_setting, setting_value
 from .security import decrypt_secret, encrypt_secret, hash_password, new_token, token_hash, utc_now, verify_password
 from .tenancy import backfill_legacy_rows, current_workspace, ensure_default_plans, ensure_default_workspace, require_owned, workspace_filter
 from .services import (
     candidates_from_zip,
     cv_outreach_readiness_error,
+    LLMProviderUnavailable,
+    llm_circuit_open,
     render_pdf,
     research_company,
     send_email,
@@ -47,6 +51,9 @@ from .services import (
     test_llm_connection,
     test_smtp_connection,
 )
+
+
+log = logging.getLogger("tailormail.main")
 
 
 @asynccontextmanager
@@ -933,6 +940,18 @@ def audit(db, campaign: Campaign, action: str, detail: str, user_id: int | None 
     db.add(AuditEvent(campaign_id=campaign.id, workspace_id=campaign.workspace_id, user_id=user_id or campaign.user_id, action=action, detail=detail))
 
 
+def _campaign_failure_detail(exc: BaseException) -> str:
+    if isinstance(exc, LLMProviderUnavailable):
+        return "AI provider unavailable. Automatic retry is paused until the provider cooldown expires."
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"External service returned HTTP {exc.response.status_code}."
+    if isinstance(exc, httpx.RequestError):
+        return "External service request failed."
+    if isinstance(exc, ValueError):
+        return str(exc)[:240]
+    return "Campaign preparation failed. Review the service configuration and retry."
+
+
 PERSONAL_EMAIL_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "aol.com", "proton.me", "protonmail.com"}
 
 
@@ -994,29 +1013,100 @@ def _job_query(
     )
 
 
+def _bounded_job_text(value, limit: int, *, default: str | None = None) -> str | None:
+    if value is None:
+        return default
+    text_value = str(value).strip()
+    return text_value[:limit] if text_value else default
+
+
+def _safe_job_integer(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or not 0 <= number <= 2_147_483_647:
+        return None
+    return int(number)
+
+
+def _json_safe_job_value(value):
+    """Make untrusted provider payloads valid JSON before they reach Postgres."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:20_000]
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {
+            str(key)[:500]: _json_safe_job_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_job_value(item) for item in value]
+    return str(value)[:20_000]
+
+
+def _job_storage_data(result) -> tuple[str, dict]:
+    external_id = _bounded_job_text(result.id, 128)
+    source = _bounded_job_text(result.source, 50)
+    apply_url = _bounded_job_text(result.apply_url, 2_000)
+    if not external_id or not source or not apply_url:
+        raise ValueError("listing is missing a required identifier")
+    return external_id, {
+        "source": source,
+        "source_job_id": _bounded_job_text(result.source_job_id, 255),
+        "sources": _json_safe_job_value(result.sources or [source]),
+        "title": _bounded_job_text(result.title, 500, default="Untitled job"),
+        "company_name": _bounded_job_text(result.company_name, 300, default="Unknown company"),
+        "company_website": _bounded_job_text(result.company_website, 1_000),
+        "location_text": _bounded_job_text(result.location_text, 500),
+        "country_code": _bounded_job_text(result.country_code, 2),
+        "city": _bounded_job_text(result.city, 160),
+        "is_remote": bool(result.is_remote),
+        "job_type": _bounded_job_text(result.job_type, 80),
+        "category": _bounded_job_text(result.category, 80),
+        "salary_min": _safe_job_integer(result.salary_min),
+        "salary_max": _safe_job_integer(result.salary_max),
+        "salary_currency": _bounded_job_text(result.salary_currency, 8),
+        "description": _bounded_job_text(result.description, 100_000),
+        "apply_url": apply_url,
+        "posted_at": result.posted_at,
+        "fetched_at": result.fetched_at,
+        "raw": _json_safe_job_value(result.raw),
+    }
+
+
 def _persist_jobs(db, workspace: Workspace, user: User, query: JobQuery, results, statuses) -> list[Job]:
     persisted: list[Job] = []
+    skipped = 0
     for result in results:
-        row = db.scalar(select(Job).where(Job.workspace_id == workspace.id, Job.external_id == result.id))
-        data = {
-            "source": result.source, "source_job_id": result.source_job_id, "sources": result.sources or [result.source],
-            "title": result.title[:500], "company_name": result.company_name[:300], "company_website": result.company_website,
-            "location_text": result.location_text, "country_code": result.country_code, "city": result.city,
-            "is_remote": result.is_remote, "job_type": result.job_type, "category": result.category,
-            "salary_min": int(result.salary_min) if result.salary_min is not None else None,
-            "salary_max": int(result.salary_max) if result.salary_max is not None else None,
-            "salary_currency": result.salary_currency, "description": result.description,
-            "apply_url": result.apply_url, "posted_at": result.posted_at, "fetched_at": result.fetched_at,
-            "raw": json.loads(json.dumps(result.raw, default=str)),
-        }
-        if row:
-            for key, value in data.items():
-                setattr(row, key, value)
-        else:
-            row = Job(workspace_id=workspace.id, external_id=result.id, **data)
-            db.add(row)
-        persisted.append(row)
-    db.flush()
+        try:
+            external_id, data = _job_storage_data(result)
+            with db.begin_nested():
+                row = db.scalar(select(Job).where(Job.workspace_id == workspace.id, Job.external_id == external_id))
+                if row:
+                    for key, value in data.items():
+                        setattr(row, key, value)
+                else:
+                    row = Job(workspace_id=workspace.id, external_id=external_id, **data)
+                    db.add(row)
+                db.flush()
+            persisted.append(row)
+        except (DataError, StatementError, TypeError, ValueError, OverflowError) as exc:
+            skipped += 1
+            log.warning(
+                "job_listing_skipped provider=%s code=%s",
+                _bounded_job_text(getattr(result, "source", None), 50, default="unknown"),
+                type(exc).__name__,
+            )
+    if skipped:
+        statuses.append(ProviderStatus("storage", "partial", f"Skipped {skipped} malformed listing(s).", skipped))
     db.add(JobSearch(
         workspace_id=workspace.id, user_id=user.id, query={"keywords": query.keywords, "country": query.country, "city": query.city, "remote_only": query.remote_only, "job_type": query.job_type, "category": query.category, "salary_min": query.salary_min, "posted_within_days": query.posted_within_days, "sources": query.sources, "page": query.page, "page_size": query.page_size},
         result_count=len(persisted), provider_statuses=[status.public() for status in statuses],
@@ -1168,23 +1258,58 @@ def prepare_job_application(request: Request, job_id: int, candidate_id: int = F
 
 
 @app.get("/")
-def dashboard(request: Request, tab: str = "applications"):
+def dashboard(request: Request, tab: str = "applications", page: int = 1, status: str = "", q: str = ""):
     if settings.environment == "production" and not request.session.get("authenticated"):
         return RedirectResponse("/landing", status_code=303)
+    valid_tabs = {"applications", "new", "jobs", "candidates", "settings"}
+    active_tab = tab if tab in valid_tabs else "applications"
+    application_statuses = ("draft", "queued", "researching", "waiting_for_ai", "ready", "sending", "sent", "failed", "send_uncertain")
+    status_filter = status if status in application_statuses else ""
+    search_term = q.strip()[:120]
+    page_size = 50
     with SessionLocal() as db:
         workspace, _ = current_workspace(request, db)
-        campaigns = db.scalars(select(Campaign).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)).order_by(Campaign.created_at.desc())).all()
-        candidates = db.scalars(select(Candidate).where(workspace_filter(Candidate, workspace), Candidate.deleted_at.is_(None)).order_by(Candidate.name)).all()
+        campaign_filters = [workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)]
+        if status_filter:
+            campaign_filters.append(Campaign.status == status_filter)
+        if search_term:
+            pattern = f"%{search_term}%"
+            campaign_filters.append((Campaign.company_name.ilike(pattern)) | (Campaign.target_role.ilike(pattern)) | (Campaign.recipient_email.ilike(pattern)))
         counts = dict(db.execute(select(Campaign.status, func.count(Campaign.id)).where(workspace_filter(Campaign, workspace), Campaign.deleted_at.is_(None)).group_by(Campaign.status)).all())
+        campaign_total = sum(counts.values())
+        filtered_campaign_total = db.scalar(select(func.count(Campaign.id)).where(*campaign_filters)) or 0
+        total_pages = max(1, (filtered_campaign_total + page_size - 1) // page_size)
+        current_page = min(max(page, 1), total_pages)
+        campaigns = []
+        if active_tab == "applications":
+            campaigns = db.scalars(
+                select(Campaign)
+                .options(selectinload(Campaign.candidate))
+                .where(*campaign_filters)
+                .order_by(Campaign.created_at.desc())
+                .offset((current_page - 1) * page_size)
+                .limit(page_size)
+            ).all()
+        candidate_total = db.scalar(select(func.count(Candidate.id)).where(workspace_filter(Candidate, workspace), Candidate.deleted_at.is_(None))) or 0
+        candidates = []
+        if active_tab in {"new", "candidates"}:
+            candidates = db.scalars(
+                select(Candidate)
+                .options(selectinload(Candidate.campaigns))
+                .where(workspace_filter(Candidate, workspace), Candidate.deleted_at.is_(None))
+                .order_by(Candidate.name)
+            ).all()
         try:
             daily_remaining = remaining_daily_send_budget(db, workspace.id)
         except ValueError:
             daily_remaining = 0
         subscription_status = status_for(db, workspace)
         announcement = setting_value(db, "announcement", "")
-        notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(20)).all()
+        unread_notification_count = db.scalar(select(func.count(Notification.id)).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None))) or 0
+        notifications = db.scalars(select(Notification).where(Notification.workspace_id == workspace.id, Notification.read_at.is_(None)).order_by(Notification.created_at.desc()).limit(10)).all()
         blocklist = db.scalars(select(Suppression).where(Suppression.workspace_id == workspace.id, Suppression.reason == "workspace_blocklist").order_by(Suppression.created_at.desc())).all()
-        jobs = db.scalars(select(OutreachJob).where(OutreachJob.workspace_id == workspace.id).order_by(OutreachJob.created_at.desc()).limit(10)).all()
+        active_job_count = db.scalar(select(func.count(OutreachJob.id)).where(OutreachJob.workspace_id == workspace.id, OutreachJob.status.in_(("queued", "running")))) or 0
+        jobs = db.scalars(select(OutreachJob).where(OutreachJob.workspace_id == workspace.id).order_by(OutreachJob.created_at.desc()).limit(5)).all()
         saved_jobs = db.scalars(
             select(Job).join(SavedJob, SavedJob.job_id == Job.id).where(SavedJob.workspace_id == workspace.id).order_by(SavedJob.created_at.desc()).limit(20)
         ).all()
@@ -1197,14 +1322,18 @@ def dashboard(request: Request, tab: str = "applications"):
             {
                 "campaigns": campaigns,
                 "candidates": candidates,
+                "campaign_total": campaign_total,
+                "candidate_total": candidate_total,
                 "counts": counts,
                 "daily_sent": (workspace.daily_limit if workspace else settings.outreach_daily_limit) - daily_remaining,
                 "daily_remaining": daily_remaining,
-                "active_tab": tab,
+                "active_tab": active_tab,
                 "settings": settings,
                 "subscription_status": subscription_status,
                 "workspace": workspace,
                 "notifications": notifications,
+                "unread_notification_count": unread_notification_count,
+                "active_job_count": active_job_count,
                 "impersonating": bool(request.session.get("impersonator_id")),
                 "email_account": email_account,
                 "ai_config": ai_config,
@@ -1213,6 +1342,16 @@ def dashboard(request: Request, tab: str = "applications"):
                 "saved_jobs": saved_jobs,
                 "job_searches": job_searches,
                 "announcement": announcement,
+                "application_statuses": application_statuses,
+                "status_filter": status_filter,
+                "application_query": urlencode({"status": status_filter, "q": search_term}),
+                "application_search": search_term,
+                "filtered_campaign_total": filtered_campaign_total,
+                "application_page": current_page,
+                "application_pages": list(range(max(1, min(current_page - 2, total_pages - 4)), min(total_pages, max(1, min(current_page - 2, total_pages - 4)) + 4) + 1)),
+                "application_page_count": total_pages,
+                "application_range_start": ((current_page - 1) * page_size + 1) if filtered_campaign_total else 0,
+                "application_range_end": min(current_page * page_size, filtered_campaign_total),
             },
         )
 
@@ -1852,7 +1991,11 @@ def prepare_campaign(campaign_id: int, request: Request = None, workspace_id: in
             workspace, _ = ensure_default_workspace(db)
         require_feature(db, workspace, "ai_tailoring")
         campaign = require_owned(db, Campaign, campaign_id, workspace)
+        ai_config = db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id))
         try:
+            provider_url = (ai_config.base_url if ai_config else "") or settings.base_url
+            if llm_circuit_open(provider_url):
+                raise LLMProviderUnavailable("AI provider is temporarily unavailable; retry after the cooldown.")
             campaign.status = "researching"
             db.commit()
 
@@ -1869,7 +2012,7 @@ def prepare_campaign(campaign_id: int, request: Request = None, workspace_id: in
                 campaign.company_name,
                 target_role=campaign.target_role,
                 job_description=campaign.job_description,
-                ai_config=db.scalar(select(AIProviderConfig).where(AIProviderConfig.workspace_id == workspace.id)),
+                ai_config=ai_config,
             )
             db.add(UsageRecord(workspace_id=workspace.id, user_id=campaign.user_id, metric="ai_requests", quantity=1, period_start=utc_now().replace(hour=0, minute=0, second=0, microsecond=0)))
 
@@ -1880,11 +2023,19 @@ def prepare_campaign(campaign_id: int, request: Request = None, workspace_id: in
             campaign.status = "ready"
             audit(db, campaign, "prepared", "Research, tailoring, and RenderCV PDF render completed.")
             db.commit()
+        except LLMProviderUnavailable as exc:
+            already_waiting = campaign.status == "waiting_for_ai"
+            campaign.status = "waiting_for_ai"
+            if not already_waiting:
+                audit(db, campaign, "waiting_for_ai", _campaign_failure_detail(exc))
+            db.commit()
+            raise HTTPException(503, "AI provider is temporarily unavailable. This campaign will retry after the cooldown.") from exc
         except Exception as exc:
             campaign.status = "failed"
-            audit(db, campaign, "failed", str(exc))
+            detail = _campaign_failure_detail(exc)
+            audit(db, campaign, "failed", detail)
             db.commit()
-            raise HTTPException(400, str(exc))
+            raise HTTPException(400, detail) from exc
     return RedirectResponse(f"/campaigns/{campaign_id}", status_code=303)
 
 

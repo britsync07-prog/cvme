@@ -1,5 +1,6 @@
 import base64
 import copy
+import hashlib
 import html
 import json
 import ipaddress
@@ -16,6 +17,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
+import redis
+from redis.exceptions import RedisError
 import yaml
 
 from .config import settings
@@ -28,6 +31,56 @@ EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 RESEARCH_SOURCE_MAX_CHARS = 3_000
 RESEARCH_MAX_SOURCES = 3
 JOB_CONTEXT_MAX_CHARS = 6_000
+
+
+class LLMProviderUnavailable(RuntimeError):
+    """The shared circuit breaker is open for the configured AI provider."""
+
+
+def _llm_circuit_key(base_url: str) -> str:
+    provider_id = hashlib.sha256(base_url.rstrip("/").casefold().encode()).hexdigest()[:24]
+    return f"tailormail:llm:circuit:{provider_id}"
+
+
+def llm_circuit_open(base_url: str) -> bool:
+    try:
+        return bool(redis.Redis.from_url(settings.redis_url, socket_connect_timeout=1, socket_timeout=1).get(_llm_circuit_key(base_url)))
+    except RedisError:
+        # Redis outages must not make a healthy LLM unavailable.
+        return False
+
+
+def _open_llm_circuit(base_url: str) -> None:
+    try:
+        redis.Redis.from_url(settings.redis_url, socket_connect_timeout=1, socket_timeout=1).setex(
+            _llm_circuit_key(base_url),
+            max(settings.llm_circuit_breaker_seconds, 60),
+            "unavailable",
+        )
+    except RedisError:
+        pass
+
+
+def _llm_status_is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.RequestError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return False
+
+
+def _llm_post(base_url: str, url: str, headers: dict, payload: dict) -> httpx.Response:
+    if llm_circuit_open(base_url):
+        raise LLMProviderUnavailable("AI provider is temporarily unavailable; retry after the cooldown.")
+    try:
+        response = _llm_request(httpx.post, url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response
+    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+        if _llm_status_is_transient(exc):
+            _open_llm_circuit(base_url)
+            raise LLMProviderUnavailable("AI provider is temporarily unavailable; retry after the cooldown.") from exc
+        raise
 
 
 def _llm_url(base_url: str, endpoint: str) -> str:
@@ -390,20 +443,20 @@ Original RenderCV YAML:
     }
 
     try:
-        response = _llm_request(httpx.post, url, headers=headers, json=payload)
-        response.raise_for_status()
+        response = _llm_post(base_url, url, headers, payload)
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code in {400, 422}:
             # Retry without response_format
             payload.pop("response_format", None)
-            response = _llm_request(httpx.post, url, headers=headers, json=payload)
-            response.raise_for_status()
+            response = _llm_post(base_url, url, headers, payload)
         else:
             raise
 
     result = None
     last_error = None
-    attempts = max(1, settings.llm_request_attempts)
+    # The configured value is the number of repair retries after the first
+    # model response, so `2` permits the original response plus two repairs.
+    attempts = max(1, settings.llm_request_attempts + 1)
     for attempt in range(attempts):
         try:
             result = _clean_json_response(_llm_content(response))
@@ -412,8 +465,7 @@ Original RenderCV YAML:
             last_error = exc
             if attempt == attempts - 1:
                 raise ValueError("AI returned invalid JSON after the configured retry limit.") from exc
-            response = _llm_request(httpx.post, url, headers=headers, json=payload)
-            response.raise_for_status()
+            response = _llm_post(base_url, url, headers, payload)
     if result is None:
         raise ValueError("AI returned no usable tailoring result.") from last_error
 
@@ -443,7 +495,7 @@ Original RenderCV YAML:
         or set(tailored_sections) != set(source_sections)
         or not source_lists_match
     ):
-        tailored_data = parsed_source
+        raise ValueError("AI CV changed protected candidate facts or section structure; the source remains unchanged.")
     if original_name and tailored_data.get("cv", {}).get("name") != original_name:
         tailored_data.setdefault("cv", {})["name"] = original_name
     if yaml.safe_dump(tailored_data, sort_keys=False) == yaml.safe_dump(parsed_source, sort_keys=False):
@@ -479,24 +531,33 @@ def render_pdf(cv_yaml: str, campaign_id: int) -> Path:
     input_path.write_text(cv_yaml, encoding="utf-8")
     pdf_path = output / "tailored_cv.pdf"
 
+    command = [
+        sys.executable,
+        "-m",
+        "rendercv",
+        "render",
+        str(input_path),
+        "--pdf-path",
+        "tailored_cv.pdf",
+        "-nomd",
+        "-nohtml",
+        "-nopng",
+        "--quiet",
+    ]
     run = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "rendercv",
-            "render",
-            str(input_path),
-            "--pdf-path",
-            "tailored_cv.pdf",
-            "-nomd",
-            "-nohtml",
-            "-nopng",
-            "--quiet",
-        ],
+        command,
         capture_output=True,
         text=True,
         timeout=180,
     )
+    if run.returncode != 0 and "No module named rendercv" in (run.stderr or ""):
+        for fallback_python in (Path(".venv312/Scripts/python.exe"), Path(".rendercv-system/Scripts/python.exe")):
+            if not fallback_python.exists():
+                continue
+            command[0] = str(fallback_python)
+            run = subprocess.run(command, capture_output=True, text=True, timeout=180)
+            if run.returncode == 0:
+                break
     if run.returncode != 0 or not pdf_path.exists():
         err_msg = run.stderr[-1500:] if run.stderr else "RenderCV exited with non-zero status"
         raise RuntimeError(f"RenderCV failed: {err_msg}")

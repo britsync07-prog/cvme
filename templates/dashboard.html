@@ -26,7 +26,7 @@
     <a href="/billing" class="tab-item">Billing</a>
     <a href="/?tab=applications" class="tab-item {% if active_tab == 'applications' %}active{% endif %}">
       Applications
-      <span class="tab-count">{{ campaigns|length }}</span>
+      <span class="tab-count">{{ campaign_total }}</span>
     </a>
     <a href="/?tab=new" class="tab-item {% if active_tab == 'new' %}active{% endif %}">
       New Application
@@ -34,7 +34,7 @@
     <a href="/?tab=jobs" class="tab-item {% if active_tab == 'jobs' %}active{% endif %}">Jobs</a>
     <a href="/?tab=candidates" class="tab-item {% if active_tab == 'candidates' %}active{% endif %}">
       Candidates
-      <span class="tab-count">{{ candidates|length }}</span>
+      <span class="tab-count">{{ candidate_total }}</span>
     </a>
     <a href="/?tab=settings" class="tab-item {% if active_tab == 'settings' %}active{% endif %}">
       System Settings
@@ -44,9 +44,34 @@
   <main class="main-content">
     {% if impersonating %}<div class="panel login-error"><strong>Impersonation active.</strong> You are viewing another workspace. <form method="post" action="/admin/stop-impersonation" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small secondary" type="submit">Return to admin</button></form></div>{% endif %}
     {% if announcement %}<div class="panel trial-banner" role="status">{{ announcement }}</div>{% endif %}
-    {% if notifications %}<section class="panel"><div class="panel-header"><h2>Notifications</h2></div>{% for notice in notifications %}<div class="notice-row"><span>{{ notice.message }}</span><form method="post" action="/notifications/{{ notice.id }}/read"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small ghost" type="submit">Mark read</button></form></div>{% endfor %}</section>{% endif %}
-    {% if jobs %}<section class="panel"><div class="panel-header"><h2>Automation jobs</h2></div>{% for job in jobs %}<div class="notice-row"><span><strong>#{{ job.id }}</strong> {{ job.job_type }} · {{ job.status }} · {{ job.progress }}%</span>{% if job.status in ['queued', 'running'] %}<form method="post" action="/jobs/{{ job.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small ghost" type="submit">Cancel</button></form>{% endif %}</div>{% endfor %}</section>{% endif %}
     {% if subscription_status and subscription_status.trial_active %}<div class="panel trial-banner"><strong>{{ subscription_status.trial_days_left }} trial days remaining.</strong> Upgrade before your trial ends to keep sending.</div>{% elif subscription_status and not subscription_status.active %}<div class="panel login-error"><strong>Sending is paused.</strong> Your trial or subscription is inactive.</div>{% endif %}
+    {% if unread_notification_count or jobs %}
+    <details class="panel operations-drawer">
+      <summary>
+        <span>Operations activity</span>
+        <span class="operations-summary">
+          {% if unread_notification_count %}{{ unread_notification_count }} unread{% endif %}
+          {% if unread_notification_count and active_job_count %} · {% endif %}
+          {% if active_job_count %}{{ active_job_count }} running{% endif %}
+          {% if not unread_notification_count and not active_job_count %}Recent automation history{% endif %}
+        </span>
+      </summary>
+      <div class="operations-grid">
+        <section>
+          <h2>Notifications</h2>
+          {% for notice in notifications %}
+          <div class="notice-row"><span>{{ notice.message }}</span><form method="post" action="/notifications/{{ notice.id }}/read"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small ghost" type="submit">Mark read</button></form></div>
+          {% else %}<p class="muted">No unread notifications.</p>{% endfor %}
+        </section>
+        <section>
+          <h2>Automation jobs</h2>
+          {% for job in jobs %}
+          <div class="notice-row"><span><strong>#{{ job.id }}</strong> {{ job.job_type }} · {{ job.status }} · {{ job.progress }}%</span>{% if job.status in ['queued', 'running'] %}<form method="post" action="/jobs/{{ job.id }}/cancel"><input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}"><button class="button small ghost" type="submit">Cancel</button></form>{% endif %}</div>
+          {% else %}<p class="muted">No recent automation jobs.</p>{% endfor %}
+        </section>
+      </div>
+    </details>
+    {% endif %}
     {% if active_tab == 'applications' %}
     <!-- APPLICATIONS TAB -->
     <div class="dashboard-title">
@@ -56,7 +81,7 @@
     <section class="metrics-grid">
       <div class="metric-card">
         <span class="metric-label">Total Applications</span>
-        <strong class="metric-value">{{ campaigns|length }}</strong>
+        <strong class="metric-value">{{ campaign_total }}</strong>
       </div>
       <div class="metric-card">
         <span class="metric-label">Draft / Pending</span>
@@ -77,21 +102,40 @@
       </div>
       <div class="metric-card">
         <span class="metric-label">Total Candidates</span>
-        <strong class="metric-value">{{ candidates|length }}</strong>
+        <strong class="metric-value">{{ candidate_total }}</strong>
       </div>
     </section>
 
     <div class="panel">
       <div class="panel-header">
         <div>
-          <h2>Target Company Applications</h2>
-          <p class="subtitle">Each application conducts company research, tailors the CV truthfully using RenderCV, and prepares a tailored email.</p>
+          <h2>Application queue</h2>
+          <p class="subtitle">{{ application_range_start }}–{{ application_range_end }} of {{ filtered_campaign_total }} matching applications. Search and filter the working set; history stays paged.</p>
         </div>
         <a href="/?tab=new" class="button primary">+ New Application</a>
       </div>
 
-      <div class="table-responsive">
-        <table class="data-table">
+      <form method="get" class="application-toolbar">
+        <input type="hidden" name="tab" value="applications">
+        <label class="application-search">
+          <span class="sr-only">Search applications</span>
+          <input name="q" value="{{ application_search }}" placeholder="Search company, role, or recipient">
+        </label>
+        <label class="application-status-filter">
+          <span class="sr-only">Filter by status</span>
+          <select name="status">
+            <option value="">All statuses</option>
+            {% for application_status in application_statuses %}
+            <option value="{{ application_status }}" {% if status_filter == application_status %}selected{% endif %}>{{ application_status.replace('_', ' ') }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <button class="button secondary" type="submit">Apply filters</button>
+        {% if application_search or status_filter %}<a class="button ghost" href="/?tab=applications">Clear</a>{% endif %}
+      </form>
+
+      <div class="table-responsive application-table-wrap">
+        <table class="data-table application-table">
           <thead>
             <tr>
               <th>Candidate</th>
@@ -132,15 +176,24 @@
             <tr>
               <td colspan="7" class="empty-state">
                 <div class="empty-icon">📂</div>
-                <h3>No applications created yet</h3>
-                <p>Add candidate profiles and launch your first company-tailored CV workflow.</p>
-                <a href="/?tab=new" class="button primary">Create First Application</a>
+                <h3>No matching applications</h3>
+                <p>{% if campaign_total %}Change or clear the filters to view more applications.{% else %}Add a candidate profile and create your first tailored application.{% endif %}</p>
+                {% if not campaign_total %}<a href="/?tab=new" class="button primary">Create first application</a>{% endif %}
               </td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
       </div>
+      {% if application_page_count > 1 %}
+      <nav class="pagination" aria-label="Application pages">
+        {% if application_page > 1 %}<a class="button small ghost" href="/?tab=applications&{{ application_query }}&page={{ application_page - 1 }}">Previous</a>{% endif %}
+        {% for page_number in application_pages %}
+        <a class="button small {% if page_number == application_page %}primary{% else %}ghost{% endif %}" href="/?tab=applications&{{ application_query }}&page={{ page_number }}" {% if page_number == application_page %}aria-current="page"{% endif %}>{{ page_number }}</a>
+        {% endfor %}
+        {% if application_page < application_page_count %}<a class="button small ghost" href="/?tab=applications&{{ application_query }}&page={{ application_page + 1 }}">Next</a>{% endif %}
+      </nav>
+      {% endif %}
     </div>
 
     {% elif active_tab == 'new' %}
